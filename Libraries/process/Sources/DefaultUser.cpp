@@ -269,11 +269,18 @@ userHomeDirectory() const
     CloseHandle(process);
     return WideStringToString(buffer);
 #else
-    char *home = ::getpwuid(::getuid())->pw_dir;
-    if (home != nullptr) {
-        return std::string(home);
-    } else {
-        return ext::nullopt;
+    if (struct passwd const *pw = ::getpwuid(::getuid())) {
+        if (pw->pw_name != nullptr) {
+            return std::string(pw->pw_dir);
+        }
     }
+
+    // Fallback to $HOME if no home is set
+    const char* home = std::getenv("HOME");
+    if (home && *home) {
+        return std::string(home);
+    }
+
+    return ext::nullopt;
 #endif
 }
