@@ -230,12 +230,33 @@ std::string projectSignature(pbxproj::PBX::Project const &project) {
     return "PROJECT@v11_hash=" + projectGUID(project);
 }
 
+/* FNV-1a 64-bit hash, rendered twice (with seed shift) to produce 32 hex chars. */
+std::string hashHex32(std::string const &s) {
+    auto fnv = [](std::string const &str, uint64_t seed) {
+        uint64_t h = 14695981039346656037ULL ^ seed;
+        for (unsigned char c : str) {
+            h ^= c;
+            h *= 1099511628211ULL;
+        }
+        return h;
+    };
+    char buf[33];
+    snprintf(buf, sizeof(buf), "%016llx%016llx",
+             (unsigned long long)fnv(s, 0),
+             (unsigned long long)fnv(s, 0xa5a5a5a5a5a5a5a5ULL));
+    return std::string(buf);
+}
+
 std::string targetSignature(pbxproj::PBX::Project const &project, pbxproj::PBX::Target const &target) {
     return "TARGET@v11_hash=" + padHex(target.blueprintIdentifier(), 32);
 }
 
-std::string workspaceSignature(pbxproj::PBX::Project const &project) {
-    std::string g = projectGUID(project);
+std::string workspaceGUID(std::string const &workspacePath) {
+    return hashHex32("workspace:" + workspacePath);
+}
+
+std::string workspaceSignature(std::string const &workspacePath) {
+    std::string g = workspaceGUID(workspacePath);
     return "WORKSPACE@v11_hash=" + g + "_subobjects=" + g;
 }
 
@@ -377,8 +398,13 @@ JObject emitBuildPhase(pbxproj::PBX::Project const &project, pbxproj::PBX::Build
 /*
  * Recursively emit a node from the project's group tree.
  * Files and groups have slightly different shapes in the PIF.
+ *
+ * `excluded` holds GUIDs of FileReferences that are productReferences of
+ * targets in this project; we drop them from the group tree because the host
+ * emits them only as productReference on the target. Otherwise both entries
+ * would share a GUID and the PIF loader would reject it as a duplicate.
  */
-JValue emitNode(pbxproj::PBX::Project const &project, pbxproj::PBX::GroupItem const &item) {
+JValue emitNode(pbxproj::PBX::Project const &project, pbxproj::PBX::GroupItem const &item, std::unordered_set<std::string> const &excluded) {
     JObject o;
     o["guid"] = objectGUID(project, item);
     o["sourceTree"] = item.sourceTree().empty() ? std::string("<group>") : item.sourceTree();
@@ -405,7 +431,8 @@ JValue emitNode(pbxproj::PBX::Project const &project, pbxproj::PBX::GroupItem co
             auto const &g = static_cast<pbxproj::PBX::BaseGroup const &>(item);
             JArray children;
             for (auto const &c : g.children()) {
-                children.push_back(emitNode(project, *c));
+                if (excluded.count(objectGUID(project, *c))) continue;
+                children.push_back(emitNode(project, *c, excluded));
             }
             o["children"] = children;
             break;
@@ -415,7 +442,8 @@ JValue emitNode(pbxproj::PBX::Project const &project, pbxproj::PBX::GroupItem co
             auto const &g = static_cast<pbxproj::PBX::BaseGroup const &>(item);
             JArray children;
             for (auto const &c : g.children()) {
-                children.push_back(emitNode(project, *c));
+                if (excluded.count(objectGUID(project, *c))) continue;
+                children.push_back(emitNode(project, *c, excluded));
             }
             o["children"] = children;
             break;
@@ -425,7 +453,8 @@ JValue emitNode(pbxproj::PBX::Project const &project, pbxproj::PBX::GroupItem co
             auto const &g = static_cast<pbxproj::PBX::BaseGroup const &>(item);
             JArray children;
             for (auto const &c : g.children()) {
-                children.push_back(emitNode(project, *c));
+                if (excluded.count(objectGUID(project, *c))) continue;
+                children.push_back(emitNode(project, *c, excluded));
             }
             o["children"] = children;
             break;
@@ -511,8 +540,19 @@ JObject emitProject(pbxproj::PBX::Project const &project) {
         p["defaultConfigurationName"] = std::string("");
     }
 
+    /* Build the set of file refs that are productReferences of any target in
+     * this project, so we can omit them from the group tree. */
+    std::unordered_set<std::string> productRefs;
+    for (auto const &target : project.targets()) {
+        if (target->type() != pbxproj::PBX::Target::Type::Native) continue;
+        auto const &nt = static_cast<pbxproj::PBX::NativeTarget const &>(*target);
+        if (nt.productReference()) {
+            productRefs.insert(objectGUID(project, *nt.productReference()));
+        }
+    }
+
     if (project.mainGroup()) {
-        p["groupTree"] = emitNode(project, *project.mainGroup());
+        p["groupTree"] = emitNode(project, *project.mainGroup(), productRefs);
     }
 
     JArray targetSigs;
@@ -688,8 +728,7 @@ Run(process::User const *user, process::Context const *processContext, Filesyste
     {
         JObject ws;
         JObject contents;
-        contents["guid"] = projects.empty() ? std::string("00000000000000000000000000000000")
-                                            : projectGUID(*projects.front());
+        contents["guid"] = workspaceGUID(workspacePath);
         contents["name"] = workspaceName;
         contents["path"] = workspacePath;
         JArray projectSigs;
@@ -697,8 +736,7 @@ Run(process::User const *user, process::Context const *processContext, Filesyste
         contents["projects"] = projectSigs;
 
         ws["type"] = "workspace";
-        ws["signature"] = projects.empty() ? std::string("WORKSPACE@v11_hash=00000000000000000000000000000000_subobjects=00000000000000000000000000000000")
-                                           : workspaceSignature(*projects.front());
+        ws["signature"] = workspaceSignature(workspacePath);
         ws["contents"] = contents;
         pif.push_back(ws);
     }
