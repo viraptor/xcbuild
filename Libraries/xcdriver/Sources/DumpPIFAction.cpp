@@ -356,7 +356,27 @@ JArray emitBuildConfigurations(pbxproj::PBX::Project const &project, pbxproj::XC
     return arr;
 }
 
-JArray emitBuildFiles(pbxproj::PBX::Project const &project, pbxproj::PBX::BuildPhase const &phase) {
+/*
+ * Build a map from a FileReference's GUID (within this project) to the GUID
+ * of the target whose productReference points at it. Used to translate
+ * buildFile.fileReference into a buildFile.targetReference when the
+ * referenced file is another target's product, since the file reference
+ * itself isn't emitted as a top-level entry.
+ */
+std::unordered_map<std::string, std::string>
+productFileToTarget(pbxproj::PBX::Project const &project) {
+    std::unordered_map<std::string, std::string> m;
+    for (auto const &t : project.targets()) {
+        if (t->type() != pbxproj::PBX::Target::Type::Native) continue;
+        auto const &nt = static_cast<pbxproj::PBX::NativeTarget const &>(*t);
+        if (nt.productReference()) {
+            m[objectGUID(project, *nt.productReference())] = padHex(t->blueprintIdentifier(), 32);
+        }
+    }
+    return m;
+}
+
+JArray emitBuildFiles(pbxproj::PBX::Project const &project, pbxproj::PBX::BuildPhase const &phase, std::unordered_map<std::string, std::string> const &prodToTarget) {
     JArray arr;
     for (auto const &bf : phase.files()) {
         /* Skip orphaned build files with no file or target reference — pbxproj
@@ -364,9 +384,33 @@ JArray emitBuildFiles(pbxproj::PBX::Project const &project, pbxproj::PBX::BuildP
          * reference was deleted. The PIF loader rejects BuildFile dictionaries
          * lacking a fileReference/targetReference. */
         if (bf->fileRef() == nullptr) continue;
+
         JObject o;
         o["guid"] = objectGUID(project, *bf);
-        o["fileReference"] = objectGUID(project, *bf->fileRef());
+
+        /* If the referenced file is another target's product, emit a
+         * targetReference instead — the product file itself is not declared
+         * as a top-level entry in the PIF. */
+        std::string frGuid = objectGUID(project, *bf->fileRef());
+        auto it = prodToTarget.find(frGuid);
+        if (it != prodToTarget.end()) {
+            o["targetReference"] = it->second;
+        } else {
+            o["fileReference"] = frGuid;
+        }
+
+        /* Translate per-file attributes (CodeSignOnCopy, header visibility) to
+         * the keys the host emits on each buildFile entry. */
+        for (auto const &attr : bf->attributes()) {
+            if (attr == "CodeSignOnCopy") {
+                o["codeSignOnCopy"] = std::string("true");
+            } else if (attr == "Public") {
+                o["headerVisibility"] = std::string("public");
+            } else if (attr == "Private") {
+                o["headerVisibility"] = std::string("private");
+            }
+        }
+
         if (!bf->compilerFlags().empty()) {
             std::string joined;
             for (size_t i = 0; i < bf->compilerFlags().size(); i++) {
@@ -380,10 +424,10 @@ JArray emitBuildFiles(pbxproj::PBX::Project const &project, pbxproj::PBX::BuildP
     return arr;
 }
 
-JObject emitBuildPhase(pbxproj::PBX::Project const &project, pbxproj::PBX::BuildPhase const &phase) {
+JObject emitBuildPhase(pbxproj::PBX::Project const &project, pbxproj::PBX::BuildPhase const &phase, std::unordered_map<std::string, std::string> const &prodToTarget) {
     JObject o;
     o["guid"] = objectGUID(project, phase);
-    o["buildFiles"] = emitBuildFiles(project, phase);
+    o["buildFiles"] = emitBuildFiles(project, phase, prodToTarget);
 
     using T = pbxproj::PBX::BuildPhase::Type;
     switch (phase.type()) {
@@ -646,9 +690,10 @@ JObject emitTarget(pbxproj::PBX::Project const &project, pbxproj::PBX::Target co
         t["buildConfigurations"] = JArray{};
     }
 
+    auto prodToTarget = productFileToTarget(project);
     JArray phases;
     for (auto const &phase : target.buildPhases()) {
-        phases.push_back(emitBuildPhase(project, *phase));
+        phases.push_back(emitBuildPhase(project, *phase, prodToTarget));
     }
     t["buildPhases"] = phases;
 
