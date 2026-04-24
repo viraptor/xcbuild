@@ -206,26 +206,6 @@ std::string objectGUID(pbxproj::PBX::Project const &project, pbxproj::PBX::Objec
     return projectGUID(project) + padHex(id, 32);
 }
 
-/*
- * Synthesize a guid from an arbitrary tag (used for sub-objects like buildFile
- * entries that pbxproj doesn't always have a stable identifier for).
- */
-std::string syntheticGUID(pbxproj::PBX::Project const &project, std::string const &tag, size_t idx) {
-    std::string suffix = tag;
-    char buf[16];
-    snprintf(buf, sizeof(buf), "_%zu", idx);
-    suffix += buf;
-    /* Pad/repeat to 32 hex-ish characters. */
-    std::string hex;
-    for (char c : suffix) {
-        char b[3];
-        snprintf(b, sizeof(b), "%02x", (unsigned char)c);
-        hex += b;
-        if (hex.size() >= 32) break;
-    }
-    return projectGUID(project) + padHex(hex, 32);
-}
-
 std::string projectSignature(pbxproj::PBX::Project const &project) {
     return "PROJECT@v11_hash=" + projectGUID(project);
 }
@@ -671,14 +651,6 @@ JObject emitProject(pbxproj::PBX::Project const &project) {
     p["targets"] = targetSigs;
 
     return p;
-}
-
-std::string productTypeForTarget(pbxproj::PBX::Target const &target) {
-    if (target.type() == pbxproj::PBX::Target::Type::Native) {
-        auto const &nt = static_cast<pbxproj::PBX::NativeTarget const &>(target);
-        return nt.productType();
-    }
-    return "";
 }
 
 JObject emitTarget(pbxproj::PBX::Project const &project, pbxproj::PBX::Target const &target) {
