@@ -260,6 +260,46 @@ std::string workspaceSignature(std::string const &workspacePath) {
     return "WORKSPACE@v11_hash=" + g + "_subobjects=" + g;
 }
 
+/*
+ * Infer a file type identifier from a file's path extension. Mirrors the
+ * fallback Xcode uses when a PBXFileReference has neither lastKnownFileType
+ * nor explicitFileType. Unknown extensions resolve to "file".
+ */
+std::string inferFileType(std::string const &path) {
+    auto slash = path.find_last_of('/');
+    std::string base = slash == std::string::npos ? path : path.substr(slash + 1);
+    auto dot = base.rfind('.');
+    if (dot == std::string::npos) return "file";
+    std::string ext = base.substr(dot + 1);
+    if (ext == "h")           return "sourcecode.c.h";
+    if (ext == "c")           return "sourcecode.c.c";
+    if (ext == "m")           return "sourcecode.c.objc";
+    if (ext == "mm")          return "sourcecode.cpp.objcpp";
+    if (ext == "cpp" || ext == "cc" || ext == "cxx") return "sourcecode.cpp.cpp";
+    if (ext == "hpp" || ext == "hh" || ext == "hxx") return "sourcecode.cpp.h";
+    if (ext == "swift")       return "sourcecode.swift";
+    if (ext == "plist")       return "text.plist.xml";
+    if (ext == "entitlements") return "text.plist.entitlements";
+    if (ext == "xib")         return "file.xib";
+    if (ext == "storyboard")  return "file.storyboard";
+    if (ext == "json")        return "text.json";
+    if (ext == "xml")         return "text.xml";
+    if (ext == "txt")         return "text";
+    if (ext == "md")          return "net.daringfireball.markdown";
+    if (ext == "sh")          return "text.script.sh";
+    if (ext == "py")          return "text.script.python";
+    if (ext == "a")           return "archive.ar";
+    if (ext == "dylib")       return "compiled.mach-o.dylib";
+    if (ext == "framework")   return "wrapper.framework";
+    if (ext == "app")         return "wrapper.application";
+    if (ext == "xctest")      return "wrapper.cfbundle";
+    if (ext == "xcconfig")    return "text.xcconfig";
+    if (ext == "css")         return "text.css";
+    if (ext == "html")        return "text.html";
+    if (ext == "rtf")         return "text.rtf";
+    return "file";
+}
+
 /* Map a CopyFilesBuildPhase destination enum to the build setting macro Xcode emits. */
 std::string copyFilesDestination(uint32_t spec) {
     using D = pbxproj::PBX::CopyFilesBuildPhase;
@@ -464,7 +504,8 @@ JValue emitNode(pbxproj::PBX::Project const &project, pbxproj::PBX::GroupItem co
             auto const &fr = static_cast<pbxproj::PBX::FileReference const &>(item);
             std::string ft = fr.lastKnownFileType();
             if (ft.empty()) ft = fr.explicitFileType();
-            if (!ft.empty()) o["fileType"] = ft;
+            if (ft.empty()) ft = inferFileType(item.path().empty() ? item.name() : item.path());
+            o["fileType"] = ft;
             /* Only emit fileTextEncoding for text-based file types — skip
              * binaries like .xib, images, archives, wrappers. */
             bool isTextual = ft.compare(0, 11, "sourcecode.") == 0
