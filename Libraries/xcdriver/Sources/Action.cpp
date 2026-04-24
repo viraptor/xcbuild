@@ -122,6 +122,8 @@ Determine(Options const &options)
         return ExportArchive;
     } else if (options.exportLocalizations() || options.importLocalizations()) {
         return Localizations;
+    } else if (options.dumpPIF()) {
+        return DumpPIF;
     } else if (options.list()) {
         return List;
     } else if (options.showBuildSettings()) {

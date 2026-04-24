@@ -46,6 +46,7 @@ public:
         Find,
         ExportArchive,
         Localizations,
+        DumpPIF,
     };
 
 public:

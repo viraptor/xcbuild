@@ -10,6 +10,7 @@
 #include <xcdriver/Action.h>
 #include <xcdriver/Options.h>
 #include <xcdriver/BuildAction.h>
+#include <xcdriver/DumpPIFAction.h>
 #include <xcdriver/FindAction.h>
 #include <xcdriver/HelpAction.h>
 #include <xcdriver/LicenseAction.h>
@@ -79,6 +80,8 @@ Run(process::User const *user, process::Context const *processContext, process::
         case Action::Localizations:
             fprintf(stderr, "warning: localizations not implemented\n");
             break;
+        case Action::DumpPIF:
+            return DumpPIFAction::Run(user, processContext, filesystem, options);
     }
 
     return 0;

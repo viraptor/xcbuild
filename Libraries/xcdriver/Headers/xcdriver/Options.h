@@ -59,6 +59,7 @@ private:
     ext::optional<bool>        _list;
     ext::optional<bool>        _showSDKs;
     ext::optional<bool>        _showBuildSettings;
+    ext::optional<std::string> _dumpPIF;
 
 private:
     ext::optional<std::string> _xcconfig;
@@ -175,6 +176,8 @@ public:
     { return _showSDKs.value_or(false); }
     bool showBuildSettings() const
     { return _showBuildSettings.value_or(false); }
+    ext::optional<std::string> const &dumpPIF() const
+    { return _dumpPIF; }
 
 public:
     ext::optional<std::string> const &xcconfig() const
