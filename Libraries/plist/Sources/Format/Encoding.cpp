@@ -10,6 +10,7 @@
 #include <plist/Format/unicode.h>
 
 #include <cassert>
+#include <cstdlib> /* abort() */
 
 #if defined(__linux__)
 #include <endian.h>
