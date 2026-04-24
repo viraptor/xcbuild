@@ -237,7 +237,7 @@ beginInvocation(pbxbuild::Tool::Invocation const &invocation, std::string const 
 
         if (invocation.showEnvironmentInLog()) {
             std::map<std::string, std::string> sortedEnvironment = std::map<std::string, std::string>(invocation.environment().begin(), invocation.environment().end());
-            for (std::pair<std::string, std::string> const &entry : sortedEnvironment) {
+            for (auto const &entry : sortedEnvironment) {
                 message += INDENT + "export " + entry.first + "=" + entry.second + "\n";
             }
         }
