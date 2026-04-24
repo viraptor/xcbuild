@@ -117,7 +117,7 @@ resolve(
     std::unordered_map<std::string, std::string> environmentVariables = scriptEnvironment.computeValues(pbxsetting::Condition::Empty());
 
     Tool::Invocation invocation;
-    invocation.executable() = Tool::Invocation::Executable::External("/bin/sh");
+    invocation.executable() = Tool::Invocation::Executable::External("sh");
     invocation.arguments() = { "-c", Escape::Shell(scriptFilePath) };
     invocation.environment() = environmentVariables;
     invocation.workingDirectory() = toolContext->workingDirectory();
@@ -181,7 +181,7 @@ resolve(
     std::unordered_map<std::string, std::string> environmentVariables = ruleEnvironment.computeValues(pbxsetting::Condition::Empty());
 
     Tool::Invocation invocation;
-    invocation.executable() = Tool::Invocation::Executable::External("/bin/sh");
+    invocation.executable() = Tool::Invocation::Executable::External("sh");
     invocation.arguments() = { "-c", buildRule->script() };
     invocation.environment() = environmentVariables;
     invocation.workingDirectory() = toolContext->workingDirectory();
