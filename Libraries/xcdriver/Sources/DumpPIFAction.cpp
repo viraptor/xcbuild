@@ -411,6 +411,19 @@ JArray emitBuildFiles(pbxproj::PBX::Project const &project, pbxproj::PBX::BuildP
             }
         }
 
+        /* .intentdefinition sources default to public codegen visibility, like
+         * the host. Also emit intentsCodegenFiles: "true" — the legacy boolean
+         * key that swift-build still honors as a fallback. */
+        if (bf->fileRef()->type() == pbxproj::PBX::GroupItem::Type::FileReference) {
+            auto const &fr = static_cast<pbxproj::PBX::FileReference const &>(*bf->fileRef());
+            std::string ft = fr.lastKnownFileType();
+            if (ft.empty()) ft = fr.explicitFileType();
+            if (ft == "file.intentdefinition") {
+                o["intentsCodegenVisibility"] = std::string("public");
+                o["intentsCodegenFiles"] = std::string("true");
+            }
+        }
+
         if (!bf->compilerFlags().empty()) {
             std::string joined;
             for (size_t i = 0; i < bf->compilerFlags().size(); i++) {
