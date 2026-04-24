@@ -359,11 +359,14 @@ JArray emitBuildConfigurations(pbxproj::PBX::Project const &project, pbxproj::XC
 JArray emitBuildFiles(pbxproj::PBX::Project const &project, pbxproj::PBX::BuildPhase const &phase) {
     JArray arr;
     for (auto const &bf : phase.files()) {
+        /* Skip orphaned build files with no file or target reference — pbxproj
+         * leaves these around as `(null)` entries when the underlying file
+         * reference was deleted. The PIF loader rejects BuildFile dictionaries
+         * lacking a fileReference/targetReference. */
+        if (bf->fileRef() == nullptr) continue;
         JObject o;
         o["guid"] = objectGUID(project, *bf);
-        if (bf->fileRef() != nullptr) {
-            o["fileReference"] = objectGUID(project, *bf->fileRef());
-        }
+        o["fileReference"] = objectGUID(project, *bf->fileRef());
         if (!bf->compilerFlags().empty()) {
             std::string joined;
             for (size_t i = 0; i < bf->compilerFlags().size(); i++) {
@@ -401,7 +404,9 @@ JObject emitBuildPhase(pbxproj::PBX::Project const &project, pbxproj::PBX::Build
             auto const &cp = static_cast<pbxproj::PBX::CopyFilesBuildPhase const &>(phase);
             o["destinationSubfolder"] = copyFilesDestination(cp.dstSubfolderSpec());
             o["destinationSubpath"] = cp.dstPath().raw();
-            o["runOnlyForDeploymentPostprocessing"] = std::string(phase.runOnlyForDeploymentPostprocessing() ? "true" : "false");
+            if (phase.runOnlyForDeploymentPostprocessing()) {
+                o["runOnlyForDeploymentPostprocessing"] = std::string("true");
+            }
             break;
         }
         case T::ShellScript: {
@@ -474,7 +479,9 @@ JValue emitNode(pbxproj::PBX::Project const &project, pbxproj::PBX::GroupItem co
                 if (excluded.count(objectGUID(project, *c))) continue;
                 children.push_back(emitNode(project, *c, excluded));
             }
-            o["children"] = children;
+            if (!children.empty()) {
+                o["children"] = children;
+            }
             break;
         }
         case GT::VariantGroup: {
@@ -485,7 +492,9 @@ JValue emitNode(pbxproj::PBX::Project const &project, pbxproj::PBX::GroupItem co
                 if (excluded.count(objectGUID(project, *c))) continue;
                 children.push_back(emitNode(project, *c, excluded));
             }
-            o["children"] = children;
+            if (!children.empty()) {
+                o["children"] = children;
+            }
             break;
         }
         case GT::VersionGroup: {
@@ -496,7 +505,9 @@ JValue emitNode(pbxproj::PBX::Project const &project, pbxproj::PBX::GroupItem co
                 if (excluded.count(objectGUID(project, *c))) continue;
                 children.push_back(emitNode(project, *c, excluded));
             }
-            o["children"] = children;
+            if (!children.empty()) {
+                o["children"] = children;
+            }
             break;
         }
         case GT::FileReference: {
@@ -617,7 +628,10 @@ JObject emitTarget(pbxproj::PBX::Project const &project, pbxproj::PBX::Target co
     JObject t;
     t["guid"] = padHex(target.blueprintIdentifier(), 32);
     t["name"] = target.name();
-    t["classPrefix"] = project.classPrefix();
+    /* Match host: target.classPrefix is only emitted when the project has one. */
+    if (!project.classPrefix().empty()) {
+        t["classPrefix"] = project.classPrefix();
+    }
 
     using TT = pbxproj::PBX::Target::Type;
     switch (target.type()) {
