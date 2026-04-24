@@ -469,7 +469,7 @@ main(int argc, char **argv)
 {
     DefaultFilesystem filesystem = DefaultFilesystem();
     process::DefaultContext processContext = process::DefaultContext();
-    process::DefaultLauncher processLauncher = process::DefaultLauncher();
+    process::DefaultLauncher processLauncher = process::DefaultLauncher(false);
     process::DefaultUser user = process::DefaultUser();
     return Run(&filesystem, &user, &processContext, &processLauncher);
 }

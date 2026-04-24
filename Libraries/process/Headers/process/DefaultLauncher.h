@@ -20,11 +20,14 @@ namespace process {
  */
 class DefaultLauncher : public Launcher {
 public:
-    DefaultLauncher();
+    DefaultLauncher(bool sync_output);
     ~DefaultLauncher();
 
 public:
     virtual ext::optional<int> launch(libutil::Filesystem *filesystem, Context const *context);
+
+private:
+    bool sync_output_;
 };
 
 }

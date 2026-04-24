@@ -19,7 +19,7 @@ main(int argc, char **argv)
 {
     DefaultFilesystem filesystem = DefaultFilesystem();
     process::DefaultContext processContext = process::DefaultContext();
-    process::DefaultLauncher processLauncher = process::DefaultLauncher();
+    process::DefaultLauncher processLauncher = process::DefaultLauncher(true);
     process::DefaultUser user = process::DefaultUser();
     return xcdriver::Driver::Run(&user, &processContext, &processLauncher, &filesystem);
 }
