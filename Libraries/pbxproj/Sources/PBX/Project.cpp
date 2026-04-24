@@ -96,8 +96,10 @@ parse(Context &context, plist::Dictionary const *dict, std::unordered_set<std::s
     }
 
     if (A != nullptr) {
-        // TODO(grp): Handle attributes.
-        (void)A;
+        if (auto CP = A->value<plist::String>("CLASSPREFIX")) {
+            _classPrefix = CP->value();
+        }
+        // TODO(grp): Handle remaining attributes.
     }
 
     if (CV != nullptr) {

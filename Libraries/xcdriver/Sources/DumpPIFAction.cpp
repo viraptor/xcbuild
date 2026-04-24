@@ -28,7 +28,8 @@
 #include <pbxproj/XC/ConfigurationList.h>
 #include <pbxproj/XC/VersionGroup.h>
 #include <pbxbuild/WorkspaceContext.h>
-#include <pbxbuild/Build/Environment.h>
+#include <xcworkspace/XC/Workspace.h>
+#include <pbxsetting/Environment.h>
 #include <pbxsetting/Setting.h>
 #include <pbxsetting/Value.h>
 #include <libutil/Filesystem.h>
@@ -435,6 +436,23 @@ JValue emitNode(pbxproj::PBX::Project const &project, pbxproj::PBX::GroupItem co
             std::string ft = fr.lastKnownFileType();
             if (ft.empty()) ft = fr.explicitFileType();
             if (!ft.empty()) o["fileType"] = ft;
+            /* Only emit fileTextEncoding for text-based file types — skip
+             * binaries like .xib, images, archives, wrappers. */
+            bool isTextual = ft.compare(0, 11, "sourcecode.") == 0
+                          || ft.compare(0, 5,  "text.") == 0
+                          || ft == "text"
+                          || ft.empty();
+            if (isTextual) {
+                using FE = pbxproj::PBX::FileReference::FileEncoding;
+                switch (fr.fileEncoding()) {
+                    case FE::UTF8:    o["fileTextEncoding"] = std::string("utf-8"); break;
+                    case FE::UTF16:   o["fileTextEncoding"] = std::string("utf-16"); break;
+                    case FE::UTF16BE: o["fileTextEncoding"] = std::string("utf-16be"); break;
+                    case FE::UTF16LE: o["fileTextEncoding"] = std::string("utf-16le"); break;
+                    case FE::Default: break;
+                    default: break;
+                }
+            }
             break;
         }
         case GT::ReferenceProxy: {
@@ -447,28 +465,29 @@ JValue emitNode(pbxproj::PBX::Project const &project, pbxproj::PBX::GroupItem co
 
 /*
  * Pick a reasonable predominant source language based on the file extensions
- * found in the target's Sources build phase. Matches xcodebuild's behavior of
- * preferring Swift if it dominates, ObjC++ if any .mm/.cpp source is present,
- * and ObjC otherwise.
+ * found in the target's Sources build phase. Returns nullopt when the target
+ * has no source files (e.g. aggregate or copy-only targets) so callers can
+ * skip emitting the field, matching the host's behavior.
  */
-std::string predominantSourceCodeLanguage(pbxproj::PBX::Target const &target) {
-    int objc = 0, objcpp = 0, swift = 0;
+ext::optional<std::string> predominantSourceCodeLanguage(pbxproj::PBX::Target const &target) {
+    int total = 0, objcpp = 0, swift = 0;
     for (auto const &phase : target.buildPhases()) {
         if (phase->type() != pbxproj::PBX::BuildPhase::Type::Sources) continue;
         for (auto const &bf : phase->files()) {
             if (bf->fileRef() == nullptr) continue;
             std::string const &p = bf->fileRef()->path();
             auto dot = p.rfind('.');
-            if (dot == std::string::npos) continue;
+            if (dot == std::string::npos) { total++; continue; }
             std::string ext = p.substr(dot + 1);
+            total++;
             if (ext == "swift") swift++;
-            else if (ext == "mm" || ext == "cpp" || ext == "cc" || ext == "cxx") objcpp++;
-            else objc++;
+            else if (ext == "mm") objcpp++;
         }
     }
-    if (swift > objc + objcpp) return "Xcode.SourceCodeLanguage.Swift";
-    if (objcpp > 0) return "Xcode.SourceCodeLanguage.Objective-C-Plus-Plus";
-    return "Xcode.SourceCodeLanguage.Objective-C";
+    if (total == 0) return ext::nullopt;
+    if (swift * 2 > total) return std::string("Xcode.SourceCodeLanguage.Swift");
+    if (objcpp > 0) return std::string("Xcode.SourceCodeLanguage.Objective-C-Plus-Plus");
+    return std::string("Xcode.SourceCodeLanguage.Objective-C");
 }
 
 JObject emitProject(pbxproj::PBX::Project const &project) {
@@ -477,7 +496,7 @@ JObject emitProject(pbxproj::PBX::Project const &project) {
     p["path"] = project.projectFile();
     p["projectDirectory"] = project.basePath();
     p["developmentRegion"] = project.developmentRegion();
-    p["classPrefix"] = std::string("");
+    p["classPrefix"] = project.classPrefix();
     p["appPreferencesBuildSettings"] = JObject{};
 
     JArray known;
@@ -517,7 +536,7 @@ JObject emitTarget(pbxproj::PBX::Project const &project, pbxproj::PBX::Target co
     JObject t;
     t["guid"] = padHex(target.blueprintIdentifier(), 32);
     t["name"] = target.name();
-    t["classPrefix"] = std::string("");
+    t["classPrefix"] = project.classPrefix();
 
     using TT = pbxproj::PBX::Target::Type;
     switch (target.type()) {
@@ -554,7 +573,9 @@ JObject emitTarget(pbxproj::PBX::Project const &project, pbxproj::PBX::Target co
     }
     t["dependencies"] = deps;
 
-    t["predominantSourceCodeLanguage"] = predominantSourceCodeLanguage(target);
+    if (auto pl = predominantSourceCodeLanguage(target)) {
+        t["predominantSourceCodeLanguage"] = *pl;
+    }
 
     if (target.type() == pbxproj::PBX::Target::Type::Native) {
         auto const &nt = static_cast<pbxproj::PBX::NativeTarget const &>(target);
@@ -602,17 +623,32 @@ Run(process::User const *user, process::Context const *processContext, Filesyste
     }
     std::string const &outPath = *options.dumpPIF();
 
-    ext::optional<pbxbuild::Build::Environment> buildEnvironment = pbxbuild::Build::Environment::Default(user, processContext, filesystem);
-    if (!buildEnvironment) {
-        fprintf(stderr, "error: couldn't create build environment\n");
-        return -1;
-    }
+    /*
+     * dumpPIF doesn't actually need SDKs, build rules, or specs — it just
+     * reads project/workspace files. Skip Build::Environment::Default (which
+     * requires a working DEVELOPER_DIR / xcrun) and load the workspace with
+     * an empty base environment, matching the host's behavior.
+     */
+    pbxsetting::Environment baseEnvironment;
+    ext::optional<pbxbuild::WorkspaceContext> workspaceContext;
 
-    std::vector<pbxsetting::Level> overrideLevels = Action::CreateOverrideLevels(processContext, filesystem, buildEnvironment->baseEnvironment(), options, processContext->currentDirectory());
-    xcexecution::Parameters parameters = Action::CreateParameters(options, overrideLevels);
-
-    ext::optional<pbxbuild::WorkspaceContext> workspaceContext = parameters.loadWorkspace(filesystem, user->userName(), *buildEnvironment, processContext->currentDirectory());
-    if (!workspaceContext) {
+    if (options.workspace()) {
+        xcworkspace::XC::Workspace::shared_ptr workspace = xcworkspace::XC::Workspace::Open(filesystem, *options.workspace());
+        if (workspace == nullptr) {
+            fprintf(stderr, "error: unable to open workspace '%s'\n", options.workspace()->c_str());
+            return -1;
+        }
+        workspaceContext = pbxbuild::WorkspaceContext::Workspace(filesystem, user->userName(), baseEnvironment, workspace);
+    } else if (options.project()) {
+        std::string projectPath = libutil::FSUtil::ResolveRelativePath(*options.project(), processContext->currentDirectory());
+        pbxproj::PBX::Project::shared_ptr project = pbxproj::PBX::Project::Open(filesystem, projectPath);
+        if (project == nullptr) {
+            fprintf(stderr, "error: unable to open project '%s'\n", options.project()->c_str());
+            return -1;
+        }
+        workspaceContext = pbxbuild::WorkspaceContext::Project(filesystem, user->userName(), baseEnvironment, project);
+    } else {
+        fprintf(stderr, "error: -dumpPIF requires -workspace or -project\n");
         return -1;
     }
 

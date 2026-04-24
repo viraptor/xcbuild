@@ -63,6 +63,7 @@ private:
     std::vector<ProjectReference>      _projectReferences;
     Target::vector                     _targets;
     FileReference::vector              _fileReferences;
+    std::string                        _classPrefix;
 
 public:
     Project();
@@ -133,6 +134,10 @@ protected:
 public:
     inline FileReference::vector const &fileReferences() const
     { return _fileReferences; }
+
+public:
+    inline std::string const &classPrefix() const
+    { return _classPrefix; }
 
 public:
     inline Object::shared_ptr resolveBuildableReference(std::string const &blueprintIdentifier) const
