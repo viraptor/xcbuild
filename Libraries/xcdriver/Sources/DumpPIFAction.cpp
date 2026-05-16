@@ -63,6 +63,15 @@ DumpPIFAction::
 
 namespace {
 
+/*
+ * We're using an ad-hoc implementation of a JSON serialiser here. Normally
+ * this would be a really bad idea, but in this case:
+ * - we're not dealing with adverserial data
+ * - we need encoding only
+ * - we want minimal dependencies
+ * - there's no reason for more advanced features like streaming
+ */
+
 class JSONOut {
 public:
     std::string out;
