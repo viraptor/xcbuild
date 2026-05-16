@@ -24,6 +24,8 @@ private:
     std::string                    _shellScript;
     std::vector<pbxsetting::Value> _inputPaths;
     std::vector<pbxsetting::Value> _outputPaths;
+    std::vector<pbxsetting::Value> _inputFileListPaths;
+    std::vector<pbxsetting::Value> _outputFileListPaths;
     bool                           _showEnvVarsInLog;
 
 public:
@@ -44,6 +46,10 @@ public:
     { return _inputPaths; }
     inline std::vector<pbxsetting::Value> const &outputPaths() const
     { return _outputPaths; }
+    inline std::vector<pbxsetting::Value> const &inputFileListPaths() const
+    { return _inputFileListPaths; }
+    inline std::vector<pbxsetting::Value> const &outputFileListPaths() const
+    { return _outputFileListPaths; }
 
 public:
     inline bool showEnvVarsInLog() const

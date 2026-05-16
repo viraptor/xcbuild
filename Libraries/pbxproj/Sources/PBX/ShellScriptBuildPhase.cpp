@@ -35,9 +35,11 @@ parse(Context &context, plist::Dictionary const *dict, std::unordered_set<std::s
     auto N  = unpack.cast <plist::String> ("name");
     auto SP = unpack.cast <plist::String> ("shellPath");
     auto SS = unpack.cast <plist::String> ("shellScript");
-    auto IP = unpack.cast <plist::Array> ("inputPaths");
-    auto OP = unpack.cast <plist::Array> ("outputPaths");
-    auto SE = unpack.coerce <plist::Boolean> ("showEnvVarsInLog");
+    auto IP  = unpack.cast <plist::Array> ("inputPaths");
+    auto OP  = unpack.cast <plist::Array> ("outputPaths");
+    auto IFL = unpack.cast <plist::Array> ("inputFileListPaths");
+    auto OFL = unpack.cast <plist::Array> ("outputFileListPaths");
+    auto SE  = unpack.coerce <plist::Boolean> ("showEnvVarsInLog");
 
     if (!unpack.complete(check)) {
         fprintf(stderr, "%s", unpack.errorText().c_str());
@@ -71,6 +73,24 @@ parse(Context &context, plist::Dictionary const *dict, std::unordered_set<std::s
             if (P != nullptr) {
                 pbxsetting::Value V = pbxsetting::Value::Parse(P->value());
                 _outputPaths.push_back(V);
+            }
+        }
+    }
+
+    if (IFL != nullptr) {
+        for (size_t n = 0; n < IFL->count(); n++) {
+            auto P = IFL->value <plist::String> (n);
+            if (P != nullptr) {
+                _inputFileListPaths.push_back(pbxsetting::Value::Parse(P->value()));
+            }
+        }
+    }
+
+    if (OFL != nullptr) {
+        for (size_t n = 0; n < OFL->count(); n++) {
+            auto P = OFL->value <plist::String> (n);
+            if (P != nullptr) {
+                _outputFileListPaths.push_back(pbxsetting::Value::Parse(P->value()));
             }
         }
     }

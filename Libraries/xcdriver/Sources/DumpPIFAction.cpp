@@ -528,8 +528,12 @@ JObject emitBuildPhase(PIFContext const &ctx, pbxproj::PBX::Project const &proje
             JArray op;
             for (auto const &p : ss.outputPaths()) op.push_back(p.raw());
             o["outputFilePaths"] = op;
-            o["inputFileListPaths"] = JArray{};
-            o["outputFileListPaths"] = JArray{};
+            JArray ifl;
+            for (auto const &p : ss.inputFileListPaths()) ifl.push_back(p.raw());
+            o["inputFileListPaths"] = ifl;
+            JArray ofl;
+            for (auto const &p : ss.outputFileListPaths()) ofl.push_back(p.raw());
+            o["outputFileListPaths"] = ofl;
             o["originalObjectID"] = phase.blueprintIdentifier();
             break;
         }
