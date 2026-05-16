@@ -34,6 +34,7 @@
 #include <pbxsetting/Value.h>
 #include <libutil/Filesystem.h>
 #include <libutil/FSUtil.h>
+#include <libutil/md5.h>
 #include <process/Context.h>
 #include <process/User.h>
 
@@ -43,6 +44,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 using xcdriver::DumpPIFAction;
@@ -185,59 +187,121 @@ void emit(JSONOut &j, JValue const &v) {
 }
 
 /*
- * Pads a hex string out to the given width by prepending '0' characters.
- * Stable identifier scheme so cross-references inside one PIF dump line up.
+ * MD5 of arbitrary bytes, returned as lowercase 32-char hex. The host
+ * xcodebuild's PIF identifiers are all MD5 hashes rendered via
+ * `-[NSData dvt_lowercaseHexString]`; using MD5 throughout lets our object
+ * GUIDs and signatures line up with the host's, byte-for-byte where the
+ * inputs are reproducible.
  */
-std::string padHex(std::string s, size_t width) {
-    if (s.size() < width) s.insert(s.begin(), width - s.size(), '0');
-    return s;
-}
-
-std::string projectGUID(pbxproj::PBX::Project const &project) {
-    /* Use blueprintIdentifier or fall back to project name hash. */
-    std::string id = project.blueprintIdentifier();
-    if (id.empty()) id = "00000000000000000000000000000000";
-    return padHex(id, 32);
-}
-
-std::string objectGUID(pbxproj::PBX::Project const &project, pbxproj::PBX::Object const &obj) {
-    std::string id = obj.blueprintIdentifier();
-    if (id.empty()) id = "00000000000000000000000000000000";
-    return projectGUID(project) + padHex(id, 32);
-}
-
-std::string projectSignature(pbxproj::PBX::Project const &project) {
-    return "PROJECT@v11_hash=" + projectGUID(project);
-}
-
-/* FNV-1a 64-bit hash, rendered twice (with seed shift) to produce 32 hex chars. */
-std::string hashHex32(std::string const &s) {
-    auto fnv = [](std::string const &str, uint64_t seed) {
-        uint64_t h = 14695981039346656037ULL ^ seed;
-        for (unsigned char c : str) {
-            h ^= c;
-            h *= 1099511628211ULL;
-        }
-        return h;
-    };
+std::string md5Hex(uint8_t const *data, size_t n) {
+    md5_state_t st;
+    md5_init(&st);
+    md5_append(&st, (md5_byte_t const *)data, (int)n);
+    md5_byte_t digest[16];
+    md5_finish(&st, digest);
     char buf[33];
-    snprintf(buf, sizeof(buf), "%016llx%016llx",
-             (unsigned long long)fnv(s, 0),
-             (unsigned long long)fnv(s, 0xa5a5a5a5a5a5a5a5ULL));
+    for (int i = 0; i < 16; i++) snprintf(buf + i * 2, 3, "%02x", digest[i]);
     return std::string(buf);
 }
 
-std::string targetSignature(pbxproj::PBX::Project const &project, pbxproj::PBX::Target const &target) {
-    return "TARGET@v11_hash=" + padHex(target.blueprintIdentifier(), 32);
+std::string md5Hex(std::string const &s) {
+    return md5Hex((uint8_t const *)s.data(), s.size());
 }
 
-std::string workspaceGUID(std::string const &workspacePath) {
-    return hashHex32("workspace:" + workspacePath);
+/*
+ * Per-dump signing context: maps each project to its 32-char PIF hash
+ * (= MD5 of the project's path relative to the workspace's base dir).
+ * Object GUIDs within a project use this prefix, matching the host's scheme
+ * `<projectPifGuid><MD5(blueprintIdentifier)>`.
+ */
+struct PIFContext {
+    std::unordered_map<pbxproj::PBX::Project const *, std::string> projectHash;
+};
+
+std::string projectGUID(PIFContext const &ctx, pbxproj::PBX::Project const &project) {
+    auto it = ctx.projectHash.find(&project);
+    if (it != ctx.projectHash.end()) return it->second;
+    return std::string(32, '0');
 }
 
-std::string workspaceSignature(std::string const &workspacePath) {
-    std::string g = workspaceGUID(workspacePath);
-    return "WORKSPACE@v11_hash=" + g + "_subobjects=" + g;
+std::string objectGUID(PIFContext const &ctx, pbxproj::PBX::Project const &project, pbxproj::PBX::Object const &obj) {
+    std::string id = obj.blueprintIdentifier();
+    std::string suffix = id.empty() ? std::string(32, '0') : md5Hex(id);
+    return projectGUID(ctx, project) + suffix;
+}
+
+/*
+ * Hardcoded plugin signature observed in every host-generated PIF: this is
+ * the base-36 digest of the default empty plugin-result set, which is stable
+ * across projects. We don't load plugins, so emitting the same constant keeps
+ * the signature shape interchangeable with the host's output.
+ */
+constexpr char const *kDefaultPluginsSignature = "1OJSG6M1FOV3XYQCBH7Z29RZ0FPR9XDE1";
+
+std::string projectSignature(PIFContext const &ctx, pbxproj::PBX::Project const &project, std::string const &modHash) {
+    /* Format mirrors the host's: PROJECT@v%d_mod=%@_hash=%@plugins=%@
+     * - mod: MD5 of the project's pbxproj contents (host uses the
+     *   NSJSONSerialization of pifRepresentation; we can't reproduce that
+     *   exactly, so we substitute a stable proxy that still changes when
+     *   the project changes).
+     * - hash: MD5 of relative project path (matches the host exactly).
+     * - plugins: empty plugin set digest (constant). */
+    return "PROJECT@v11_mod=" + modHash + "_hash=" + projectGUID(ctx, project) +
+           "plugins=" + std::string(kDefaultPluginsSignature);
+}
+
+std::string targetSignature(PIFContext const &ctx, pbxproj::PBX::Project const &project, pbxproj::PBX::Target const &target) {
+    /* Host computes MD5 of NSJSONSerialization output of the target's
+     * pifRepresentation; we approximate with MD5(blueprintIdentifier) so the
+     * signature is stable and structurally identical (32 hex chars). */
+    std::string id = target.blueprintIdentifier();
+    std::string h = id.empty() ? std::string(32, '0') : md5Hex(id);
+    return "TARGET@v11_hash=" + h;
+}
+
+std::string workspaceGUID(std::string const &workspaceName) {
+    return md5Hex(workspaceName);
+}
+
+/*
+ * Reads `<workspacePath>/contents.xcworkspacedata` if present; otherwise
+ * returns the canonical self-referencing XML Xcode would synthesize for a
+ * bare project's `project.xcworkspace`. The host hashes this byte stream
+ * along with the absolute file path to produce the workspace contents hash.
+ */
+std::vector<uint8_t> readWorkspaceContentsData(Filesystem *filesystem, std::string const &contentsPath) {
+    std::vector<uint8_t> bytes;
+    if (filesystem->isReadable(contentsPath) && filesystem->read(&bytes, contentsPath)) {
+        return bytes;
+    }
+    static char const synthetic[] =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        "<Workspace\n"
+        "   version = \"1.0\">\n"
+        "   <FileRef\n"
+        "      location = \"self:\">\n"
+        "   </FileRef>\n"
+        "</Workspace>\n";
+    return std::vector<uint8_t>(synthetic, synthetic + sizeof(synthetic) - 1);
+}
+
+std::string workspaceSignature(Filesystem *filesystem,
+                               std::string const &workspacePath,
+                               std::vector<std::string> const &projectSignatures) {
+    std::string contentsPath = workspacePath + "/contents.xcworkspacedata";
+    std::vector<uint8_t> data = readWorkspaceContentsData(filesystem, contentsPath);
+
+    /* hash = MD5(file bytes ++ absolute contents path). */
+    std::vector<uint8_t> hashInput = data;
+    hashInput.insert(hashInput.end(), contentsPath.begin(), contentsPath.end());
+    std::string contentsHash = md5Hex(hashInput.data(), hashInput.size());
+
+    /* subobjects = MD5(concatenation of subobject signatures, no separator). */
+    std::string concat;
+    for (auto const &s : projectSignatures) concat += s;
+    std::string subobjectsHash = md5Hex(concat);
+
+    return "WORKSPACE@v11_hash=" + contentsHash + "_subobjects=" + subobjectsHash;
 }
 
 /*
@@ -300,9 +364,9 @@ std::string copyFilesDestination(uint32_t spec) {
     }
 }
 
-JObject emitBuildConfiguration(pbxproj::PBX::Project const &project, pbxproj::XC::BuildConfiguration const &config) {
+JObject emitBuildConfiguration(PIFContext const &ctx, pbxproj::PBX::Project const &project, pbxproj::XC::BuildConfiguration const &config) {
     JObject obj;
-    obj["guid"] = objectGUID(project, config);
+    obj["guid"] = objectGUID(ctx, project, config);
     obj["name"] = config.name();
 
     JObject settings;
@@ -323,15 +387,15 @@ JObject emitBuildConfiguration(pbxproj::PBX::Project const &project, pbxproj::XC
     obj["buildSettings"] = settings;
 
     if (config.baseConfigurationReference() != nullptr) {
-        obj["baseConfigurationFileReference"] = objectGUID(project, *config.baseConfigurationReference());
+        obj["baseConfigurationFileReference"] = objectGUID(ctx, project, *config.baseConfigurationReference());
     }
     return obj;
 }
 
-JArray emitBuildConfigurations(pbxproj::PBX::Project const &project, pbxproj::XC::ConfigurationList const &list) {
+JArray emitBuildConfigurations(PIFContext const &ctx, pbxproj::PBX::Project const &project, pbxproj::XC::ConfigurationList const &list) {
     JArray arr;
     for (auto const &cfg : list.buildConfigurations()) {
-        arr.push_back(emitBuildConfiguration(project, *cfg));
+        arr.push_back(emitBuildConfiguration(ctx, project, *cfg));
     }
     return arr;
 }
@@ -344,19 +408,21 @@ JArray emitBuildConfigurations(pbxproj::PBX::Project const &project, pbxproj::XC
  * itself isn't emitted as a top-level entry.
  */
 std::unordered_map<std::string, std::string>
-productFileToTarget(pbxproj::PBX::Project const &project) {
+productFileToTarget(PIFContext const &ctx, pbxproj::PBX::Project const &project) {
     std::unordered_map<std::string, std::string> m;
     for (auto const &t : project.targets()) {
         if (t->type() != pbxproj::PBX::Target::Type::Native) continue;
         auto const &nt = static_cast<pbxproj::PBX::NativeTarget const &>(*t);
         if (nt.productReference()) {
-            m[objectGUID(project, *nt.productReference())] = padHex(t->blueprintIdentifier(), 32);
+            std::string id = t->blueprintIdentifier();
+            m[objectGUID(ctx, project, *nt.productReference())] =
+                id.empty() ? std::string(32, '0') : md5Hex(id);
         }
     }
     return m;
 }
 
-JArray emitBuildFiles(pbxproj::PBX::Project const &project, pbxproj::PBX::BuildPhase const &phase, std::unordered_map<std::string, std::string> const &prodToTarget) {
+JArray emitBuildFiles(PIFContext const &ctx, pbxproj::PBX::Project const &project, pbxproj::PBX::BuildPhase const &phase, std::unordered_map<std::string, std::string> const &prodToTarget) {
     JArray arr;
     for (auto const &bf : phase.files()) {
         /* Skip orphaned build files with no file or target reference — pbxproj
@@ -366,12 +432,12 @@ JArray emitBuildFiles(pbxproj::PBX::Project const &project, pbxproj::PBX::BuildP
         if (bf->fileRef() == nullptr) continue;
 
         JObject o;
-        o["guid"] = objectGUID(project, *bf);
+        o["guid"] = objectGUID(ctx, project, *bf);
 
         /* If the referenced file is another target's product, emit a
          * targetReference instead — the product file itself is not declared
          * as a top-level entry in the PIF. */
-        std::string frGuid = objectGUID(project, *bf->fileRef());
+        std::string frGuid = objectGUID(ctx, project, *bf->fileRef());
         auto it = prodToTarget.find(frGuid);
         if (it != prodToTarget.end()) {
             o["targetReference"] = it->second;
@@ -417,10 +483,10 @@ JArray emitBuildFiles(pbxproj::PBX::Project const &project, pbxproj::PBX::BuildP
     return arr;
 }
 
-JObject emitBuildPhase(pbxproj::PBX::Project const &project, pbxproj::PBX::BuildPhase const &phase, std::unordered_map<std::string, std::string> const &prodToTarget) {
+JObject emitBuildPhase(PIFContext const &ctx, pbxproj::PBX::Project const &project, pbxproj::PBX::BuildPhase const &phase, std::unordered_map<std::string, std::string> const &prodToTarget) {
     JObject o;
-    o["guid"] = objectGUID(project, phase);
-    o["buildFiles"] = emitBuildFiles(project, phase, prodToTarget);
+    o["guid"] = objectGUID(ctx, project, phase);
+    o["buildFiles"] = emitBuildFiles(ctx, project, phase, prodToTarget);
 
     using T = pbxproj::PBX::BuildPhase::Type;
     switch (phase.type()) {
@@ -486,9 +552,9 @@ JObject emitBuildPhase(pbxproj::PBX::Project const &project, pbxproj::PBX::Build
  * emits them only as productReference on the target. Otherwise both entries
  * would share a GUID and the PIF loader would reject it as a duplicate.
  */
-JValue emitNode(pbxproj::PBX::Project const &project, pbxproj::PBX::GroupItem const &item, std::unordered_set<std::string> const &excluded) {
+JValue emitNode(PIFContext const &ctx, pbxproj::PBX::Project const &project, pbxproj::PBX::GroupItem const &item, std::unordered_set<std::string> const &excluded) {
     JObject o;
-    o["guid"] = objectGUID(project, item);
+    o["guid"] = objectGUID(ctx, project, item);
     o["sourceTree"] = item.sourceTree().empty() ? std::string("<group>") : item.sourceTree();
 
     using GT = pbxproj::PBX::GroupItem::Type;
@@ -513,8 +579,8 @@ JValue emitNode(pbxproj::PBX::Project const &project, pbxproj::PBX::GroupItem co
             auto const &g = static_cast<pbxproj::PBX::BaseGroup const &>(item);
             JArray children;
             for (auto const &c : g.children()) {
-                if (excluded.count(objectGUID(project, *c))) continue;
-                children.push_back(emitNode(project, *c, excluded));
+                if (excluded.count(objectGUID(ctx, project, *c))) continue;
+                children.push_back(emitNode(ctx, project, *c, excluded));
             }
             if (!children.empty()) {
                 o["children"] = children;
@@ -526,8 +592,8 @@ JValue emitNode(pbxproj::PBX::Project const &project, pbxproj::PBX::GroupItem co
             auto const &g = static_cast<pbxproj::PBX::BaseGroup const &>(item);
             JArray children;
             for (auto const &c : g.children()) {
-                if (excluded.count(objectGUID(project, *c))) continue;
-                children.push_back(emitNode(project, *c, excluded));
+                if (excluded.count(objectGUID(ctx, project, *c))) continue;
+                children.push_back(emitNode(ctx, project, *c, excluded));
             }
             if (!children.empty()) {
                 o["children"] = children;
@@ -539,8 +605,8 @@ JValue emitNode(pbxproj::PBX::Project const &project, pbxproj::PBX::GroupItem co
             auto const &g = static_cast<pbxproj::PBX::BaseGroup const &>(item);
             JArray children;
             for (auto const &c : g.children()) {
-                if (excluded.count(objectGUID(project, *c))) continue;
-                children.push_back(emitNode(project, *c, excluded));
+                if (excluded.count(objectGUID(ctx, project, *c))) continue;
+                children.push_back(emitNode(ctx, project, *c, excluded));
             }
             if (!children.empty()) {
                 o["children"] = children;
@@ -608,9 +674,12 @@ ext::optional<std::string> predominantSourceCodeLanguage(pbxproj::PBX::Target co
     return std::string("Xcode.SourceCodeLanguage.Objective-C");
 }
 
-JObject emitProject(pbxproj::PBX::Project const &project) {
+JObject emitProject(PIFContext const &ctx, pbxproj::PBX::Project const &project) {
     JObject p;
-    p["guid"] = projectGUID(project);
+    /* The project's own contents.guid is just the 32-char projectGUID
+     * (= MD5 of relative project path) — not the `<prefix><MD5(blueprint)>`
+     * form used by every other object. */
+    p["guid"] = projectGUID(ctx, project);
     p["path"] = project.projectFile();
     p["projectDirectory"] = project.basePath();
     p["developmentRegion"] = project.developmentRegion();
@@ -622,7 +691,7 @@ JObject emitProject(pbxproj::PBX::Project const &project) {
     p["knownRegions"] = known;
 
     if (project.buildConfigurationList()) {
-        p["buildConfigurations"] = emitBuildConfigurations(project, *project.buildConfigurationList());
+        p["buildConfigurations"] = emitBuildConfigurations(ctx, project, *project.buildConfigurationList());
         p["defaultConfigurationName"] = project.buildConfigurationList()->defaultConfigurationName();
     } else {
         p["buildConfigurations"] = JArray{};
@@ -636,26 +705,29 @@ JObject emitProject(pbxproj::PBX::Project const &project) {
         if (target->type() != pbxproj::PBX::Target::Type::Native) continue;
         auto const &nt = static_cast<pbxproj::PBX::NativeTarget const &>(*target);
         if (nt.productReference()) {
-            productRefs.insert(objectGUID(project, *nt.productReference()));
+            productRefs.insert(objectGUID(ctx, project, *nt.productReference()));
         }
     }
 
     if (project.mainGroup()) {
-        p["groupTree"] = emitNode(project, *project.mainGroup(), productRefs);
+        p["groupTree"] = emitNode(ctx, project, *project.mainGroup(), productRefs);
     }
 
     JArray targetSigs;
     for (auto const &t : project.targets()) {
-        targetSigs.push_back(targetSignature(project, *t));
+        targetSigs.push_back(targetSignature(ctx, project, *t));
     }
     p["targets"] = targetSigs;
 
     return p;
 }
 
-JObject emitTarget(pbxproj::PBX::Project const &project, pbxproj::PBX::Target const &target) {
+JObject emitTarget(PIFContext const &ctx, pbxproj::PBX::Project const &project, pbxproj::PBX::Target const &target) {
     JObject t;
-    t["guid"] = padHex(target.blueprintIdentifier(), 32);
+    /* Target objects use the same `<projectGuid><MD5(blueprintId)>` GUID
+     * scheme as any other object in the project — both for the target's own
+     * contents.guid and for its productReference. */
+    t["guid"] = objectGUID(ctx, project, target);
     t["name"] = target.name();
     /* Match host: target.classPrefix is only emitted when the project has one. */
     if (!project.classPrefix().empty()) {
@@ -670,15 +742,15 @@ JObject emitTarget(pbxproj::PBX::Project const &project, pbxproj::PBX::Target co
     }
 
     if (target.buildConfigurationList()) {
-        t["buildConfigurations"] = emitBuildConfigurations(project, *target.buildConfigurationList());
+        t["buildConfigurations"] = emitBuildConfigurations(ctx, project, *target.buildConfigurationList());
     } else {
         t["buildConfigurations"] = JArray{};
     }
 
-    auto prodToTarget = productFileToTarget(project);
+    auto prodToTarget = productFileToTarget(ctx, project);
     JArray phases;
     for (auto const &phase : target.buildPhases()) {
-        phases.push_back(emitBuildPhase(project, *phase, prodToTarget));
+        phases.push_back(emitBuildPhase(ctx, project, *phase, prodToTarget));
     }
     t["buildPhases"] = phases;
 
@@ -688,7 +760,11 @@ JObject emitTarget(pbxproj::PBX::Project const &project, pbxproj::PBX::Target co
     for (auto const &dep : target.dependencies()) {
         JObject d;
         if (dep->target()) {
-            d["guid"] = padHex(dep->target()->blueprintIdentifier(), 32);
+            /* Dependency GUID follows the same `<projectGuid><MD5(blueprintId)>`
+             * scheme. We use the current project's prefix; cross-project
+             * dependencies would need to look up the target's home project,
+             * but that information isn't readily available here. */
+            d["guid"] = objectGUID(ctx, project, *dep->target());
             d["name"] = dep->target()->name();
         } else {
             d["guid"] = std::string("");
@@ -707,7 +783,7 @@ JObject emitTarget(pbxproj::PBX::Project const &project, pbxproj::PBX::Target co
         t["productTypeIdentifier"] = nt.productType();
         if (nt.productReference() != nullptr) {
             JObject pr;
-            pr["guid"] = objectGUID(project, *nt.productReference());
+            pr["guid"] = objectGUID(ctx, project, *nt.productReference());
             pr["name"] = nt.productReference()->name();
             pr["type"] = std::string("product");
             t["productReference"] = pr;
@@ -809,19 +885,59 @@ Run(process::User const *user, process::Context const *processContext, Filesyste
         return -1;
     }
 
+    /*
+     * Per-project hashes go into the signing context. The host derives the
+     * 32-char project PIF GUID from MD5 of the project's filesystem path
+     * relative to the workspace's base directory. For a real workspace, that
+     * base dir is the workspace's parent; for the synthesized project-only
+     * workspace (which lives inside the .xcodeproj bundle), the host instead
+     * treats the project's own parent dir as the base — so relative project
+     * paths come out as just the basename, not "..".
+     */
+    std::string baseDir;
+    if (workspaceContext->workspace() != nullptr) {
+        baseDir = libutil::FSUtil::GetDirectoryName(workspacePath);
+    } else {
+        baseDir = libutil::FSUtil::GetDirectoryName(workspaceContext->project()->projectFile());
+    }
+
+    PIFContext ctx;
+    std::unordered_map<pbxproj::PBX::Project const *, std::string> projectMod;
+    for (auto const &project : projects) {
+        std::string rel = libutil::FSUtil::GetRelativePath(project->projectFile(), baseDir);
+        ctx.projectHash[project.get()] = md5Hex(rel);
+
+        /* Host's `_mod=` is MD5 of NSJSONSerialization output of the project's
+         * pifRepresentation — not reproducible without bit-exact JSON parity.
+         * Substitute MD5 of the .pbxproj file contents: changes whenever the
+         * project model changes, which is the property `_mod=` exists for. */
+        std::vector<uint8_t> pbxprojBytes;
+        std::string pbxprojPath = project->projectFile() + "/project.pbxproj";
+        if (filesystem->isReadable(pbxprojPath) && filesystem->read(&pbxprojBytes, pbxprojPath)) {
+            projectMod[project.get()] = md5Hex(pbxprojBytes.data(), pbxprojBytes.size());
+        } else {
+            projectMod[project.get()] = std::string(32, '0');
+        }
+    }
+
     /* Workspace object. */
     {
         JObject ws;
         JObject contents;
-        contents["guid"] = workspaceGUID(workspacePath);
+        contents["guid"] = workspaceGUID(workspaceName);
         contents["name"] = workspaceName;
         contents["path"] = workspacePath;
-        JArray projectSigs;
-        for (auto const &p : projects) projectSigs.push_back(projectSignature(*p));
-        contents["projects"] = projectSigs;
+        JArray projectSigsForJSON;
+        std::vector<std::string> projectSigsForHash;
+        for (auto const &p : projects) {
+            std::string sig = projectSignature(ctx, *p, projectMod[p.get()]);
+            projectSigsForJSON.push_back(sig);
+            projectSigsForHash.push_back(sig);
+        }
+        contents["projects"] = projectSigsForJSON;
 
         ws["type"] = "workspace";
-        ws["signature"] = workspaceSignature(workspacePath);
+        ws["signature"] = workspaceSignature(filesystem, workspacePath, projectSigsForHash);
         ws["contents"] = contents;
         pif.push_back(ws);
     }
@@ -830,15 +946,15 @@ Run(process::User const *user, process::Context const *processContext, Filesyste
     for (auto const &project : projects) {
         JObject po;
         po["type"] = "project";
-        po["signature"] = projectSignature(*project);
-        po["contents"] = emitProject(*project);
+        po["signature"] = projectSignature(ctx, *project, projectMod[project.get()]);
+        po["contents"] = emitProject(ctx, *project);
         pif.push_back(po);
 
         for (auto const &target : project->targets()) {
             JObject to;
             to["type"] = "target";
-            to["signature"] = targetSignature(*project, *target);
-            to["contents"] = emitTarget(*project, *target);
+            to["signature"] = targetSignature(ctx, *project, *target);
+            to["contents"] = emitTarget(ctx, *project, *target);
             pif.push_back(to);
         }
     }
