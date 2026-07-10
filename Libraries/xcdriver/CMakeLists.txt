@@ -54,5 +54,6 @@ install(FILES "${ALIAS_PATH}" DESTINATION usr/bin)
 if (BUILD_TESTING)
   ADD_UNIT_GTEST(xcdriver Options Tests/test_Options.cpp)
   ADD_UNIT_GTEST(xcdriver Action Tests/test_Action.cpp)
+  ADD_UNIT_GTEST(xcdriver DumpPIFAction Tests/test_DumpPIFAction.cpp)
 endif ()
 

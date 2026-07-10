@@ -423,9 +423,16 @@ productFileToTarget(PIFContext const &ctx, pbxproj::PBX::Project const &project)
         if (t->type() != pbxproj::PBX::Target::Type::Native) continue;
         auto const &nt = static_cast<pbxproj::PBX::NativeTarget const &>(*t);
         if (nt.productReference()) {
-            std::string id = t->blueprintIdentifier();
+            /* The target reference must be the target's full object GUID
+             * (`<projectGuid><MD5(blueprintId)>`), the same 64-char form the
+             * target is registered under. Emitting only the bare 32-char
+             * `MD5(blueprintId)` suffix here — dropping the project prefix —
+             * yields a targetReference the PIF loader can't resolve, which is
+             * how an implicit intra-project product link (a Frameworks-phase
+             * link to another target's .a/.framework with no explicit
+             * PBXTargetDependency) fails to build. */
             m[objectGUID(ctx, project, *nt.productReference())] =
-                id.empty() ? std::string(32, '0') : md5Hex(id);
+                objectGUID(ctx, project, *t);
         }
     }
     return m;
