@@ -52,6 +52,8 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
+#include <unistd.h>
 #include <map>
 #include <sstream>
 #include <string>
@@ -384,16 +386,53 @@ JValue toEmbeddedPackageProduct(JValue prod) {
  * package projects rather than failing.
  */
 ext::optional<std::vector<SplicedPackageObject>> loadPackagePIF(std::string const &dir) {
+    /* Capture the command's stderr to a temp file so that, when it fails, we can
+     * report *why* (missing toolchain, manifest error, ...) instead of silently
+     * dropping the package — which downstream surfaces only as swift-build's
+     * opaque "Missing package product". */
+    std::string tmpDir = "/tmp";
+    if (char const *t = getenv("TMPDIR")) {
+        if (t[0] != '\0') {
+            tmpDir = t;
+            while (tmpDir.size() > 1 && tmpDir.back() == '/') tmpDir.pop_back();
+        }
+    }
+    std::vector<char> errTemplate;
+    std::string errTemplateStr = tmpDir + "/xcbuild-swiftpm-XXXXXX";
+    errTemplate.assign(errTemplateStr.begin(), errTemplateStr.end());
+    errTemplate.push_back('\0');
+    int errFd = mkstemp(errTemplate.data());
+    std::string errPath = errFd >= 0 ? std::string(errTemplate.data()) : "/dev/null";
+    if (errFd >= 0) close(errFd);
+
     std::string cmd = "swift package --package-path " + shellSingleQuote(dir) +
-                      " --build-system swiftbuild dump-pif 2>/dev/null";
+                      " --build-system swiftbuild dump-pif 2>" + shellSingleQuote(errPath);
     FILE *pipe = popen(cmd.c_str(), "r");
-    if (pipe == nullptr) return ext::nullopt;
+    if (pipe == nullptr) {
+        if (errFd >= 0) unlink(errPath.c_str());
+        return ext::nullopt;
+    }
     std::string out;
     char buf[4096];
     size_t n;
     while ((n = fread(buf, 1, sizeof(buf), pipe)) > 0) out.append(buf, n);
     int rc = pclose(pipe);
-    if (rc != 0 || out.empty()) return ext::nullopt;
+    if (rc != 0 || out.empty()) {
+        std::string err;
+        if (errFd >= 0) {
+            if (FILE *ef = fopen(errPath.c_str(), "r")) {
+                char eb[4096];
+                size_t en;
+                while ((en = fread(eb, 1, sizeof(eb), ef)) > 0) err.append(eb, en);
+                fclose(ef);
+            }
+            unlink(errPath.c_str());
+        }
+        fprintf(stderr, "warning: `swift package ... dump-pif` failed for '%s' (exit %d); its package will be omitted from the PIF.\n%s\n",
+                dir.c_str(), rc, err.c_str());
+        return ext::nullopt;
+    }
+    if (errFd >= 0) unlink(errPath.c_str());
 
     /* First parse: discover the GUIDs that need remapping. */
     std::vector<uint8_t> bytes(out.begin(), out.end());
