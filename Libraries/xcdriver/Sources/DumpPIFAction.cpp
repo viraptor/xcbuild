@@ -319,8 +319,9 @@ JArray packageProductBuildConfigurations(std::string const &guid) {
  * package-product dependency by that name, so the `-product` suffix and wrong
  * type make it report "Missing package product". SwiftPM's dependencies and
  * frameworks phase already match the host after the GUID remap, so we reuse
- * them and only fix the envelope: for static products the whole shape becomes a
- * packageProduct; for dynamic products the product type becomes a framework.
+ * them and only fix the envelope: for static/automatic products the whole shape
+ * becomes a `packageProduct` (which is how the app links them). Dynamic and other
+ * products are left in SwiftPM's self-consistent native form.
  */
 JValue toEmbeddedPackageProduct(JValue prod) {
     if (prod.kind != JValue::K::Obj) return prod;
@@ -360,13 +361,15 @@ JValue toEmbeddedPackageProduct(JValue prod) {
         return JValue::Obj(std::move(o));
     }
 
-    if (pt.find("library.dynamic") != std::string::npos) {
-        prod.o["name"] = JValue::Str(name);
-        prod.o["productTypeIdentifier"] = JValue::Str("com.apple.product-type.framework");
-        return prod;
-    }
-
-    prod.o["name"] = JValue::Str(name);
+    /* Dynamic (and any other) library products are left in SwiftPM's native
+     * form. Forcing `.dynamic` into a framework (as the host does) only works if
+     * the productReference, EXECUTABLE_PREFIX, and framework layout are rewritten
+     * too; changing just the type leaves the target building `Sparkle.framework`
+     * while the app still embeds `libSparkle.dylib` (its unchanged
+     * productReference), which then doesn't exist. Keeping `library.dynamic`
+     * self-consistent — the target builds `lib<name>.dylib`, the product
+     * references it, and the app embeds it — and resolution is by GUID regardless
+     * of type/name, so no rewrite is needed. */
     return prod;
 }
 
