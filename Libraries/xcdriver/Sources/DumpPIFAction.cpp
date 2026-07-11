@@ -284,6 +284,87 @@ struct SplicedPackageObject {
     JValue contents;
 };
 
+/* The three-setting build configurations of a host `packageProduct` target. */
+JArray packageProductBuildConfigurations(std::string const &guid) {
+    JArray configs;
+    char const *names[2] = {"Debug", "Release"};
+    for (int i = 0; i < 2; i++) {
+        JObject c;
+        c["guid"] = guid + "::BUILDCONFIG_" + std::to_string(i);
+        c["name"] = std::string(names[i]);
+        JObject s;
+        s["SDK_VARIANT"] = std::string("auto");
+        s["SDKROOT"] = std::string("auto");
+        s["USES_SWIFTPM_UNSAFE_FLAGS"] = std::string("NO");
+        c["buildSettings"] = s;
+        JObject imp;
+        imp["buildSettings"] = JObject{};
+        c["impartedBuildProperties"] = imp;
+        configs.push_back(c);
+    }
+    return configs;
+}
+
+/*
+ * Convert SwiftPM's standalone product target into the host's app-embedded form.
+ * Standalone `dump-pif` builds a library product as an actual static/dynamic
+ * library named `<product>-product`; when a package is a *dependency*, the host
+ * instead emits a linkable `packageProduct` (static/automatic) or a `framework`
+ * target (dynamic) named exactly `<product>`. swift-build resolves a target's
+ * package-product dependency by that name, so the `-product` suffix and wrong
+ * type make it report "Missing package product". SwiftPM's dependencies and
+ * frameworks phase already match the host after the GUID remap, so we reuse
+ * them and only fix the envelope: for static products the whole shape becomes a
+ * packageProduct; for dynamic products the product type becomes a framework.
+ */
+JValue toEmbeddedPackageProduct(JValue prod) {
+    if (prod.kind != JValue::K::Obj) return prod;
+    auto gi = prod.o.find("guid");
+    if (gi == prod.o.end() || gi->second.kind != JValue::K::Str) return prod;
+    std::string guid = gi->second.s;
+    std::string name = guid.substr(std::string("PACKAGE-PRODUCT:").size());
+
+    std::string pt;
+    auto pti = prod.o.find("productTypeIdentifier");
+    if (pti != prod.o.end() && pti->second.kind == JValue::K::Str) pt = pti->second.s;
+
+    if (pt.find("library.static") != std::string::npos || pt.find("library.automatic") != std::string::npos) {
+        JObject o;
+        o["guid"] = guid;
+        o["name"] = name;
+        o["type"] = std::string("packageProduct");
+        o["approvedByUser"] = std::string("true");
+        o["customTasks"] = JArray{};
+        auto deps = prod.o.find("dependencies");
+        o["dependencies"] = deps != prod.o.end() ? deps->second : JValue::Arr({});
+        o["buildConfigurations"] = packageProductBuildConfigurations(guid);
+        /* Lift the frameworks phase out of buildPhases into frameworksBuildPhase. */
+        auto bps = prod.o.find("buildPhases");
+        if (bps != prod.o.end() && bps->second.kind == JValue::K::Arr) {
+            for (auto &ph : bps->second.a) {
+                if (ph.kind == JValue::K::Obj) {
+                    auto ty = ph.o.find("type");
+                    if (ty != ph.o.end() && ty->second.kind == JValue::K::Str &&
+                        ty->second.s.find("frameworks") != std::string::npos) {
+                        o["frameworksBuildPhase"] = ph;
+                        break;
+                    }
+                }
+            }
+        }
+        return JValue::Obj(std::move(o));
+    }
+
+    if (pt.find("library.dynamic") != std::string::npos) {
+        prod.o["name"] = JValue::Str(name);
+        prod.o["productTypeIdentifier"] = JValue::Str("com.apple.product-type.framework");
+        return prod;
+    }
+
+    prod.o["name"] = JValue::Str(name);
+    return prod;
+}
+
 /*
  * Obtain a Swift package's PIF directly from SwiftPM
  * (`swift package --build-system swiftbuild dump-pif`) and adapt it to the
@@ -382,6 +463,8 @@ ext::optional<std::vector<SplicedPackageObject>> loadPackagePIF(std::string cons
         if (isProject) {
             auto gt = jc.o.find("groupTree");
             if (gt != jc.o.end()) stripPackageFileNodeNames(gt->second);
+        } else if (guid.rfind("PACKAGE-PRODUCT:", 0) == 0) {
+            jc = toEmbeddedPackageProduct(std::move(jc));
         }
         result.push_back({isProject, guid, std::move(jc)});
     }
