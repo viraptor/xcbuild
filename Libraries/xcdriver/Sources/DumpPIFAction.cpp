@@ -361,15 +361,42 @@ JValue toEmbeddedPackageProduct(JValue prod) {
         return JValue::Obj(std::move(o));
     }
 
-    /* Dynamic (and any other) library products are left in SwiftPM's native
-     * form. Forcing `.dynamic` into a framework (as the host does) only works if
-     * the productReference, EXECUTABLE_PREFIX, and framework layout are rewritten
-     * too; changing just the type leaves the target building `Sparkle.framework`
-     * while the app still embeds `libSparkle.dylib` (its unchanged
-     * productReference), which then doesn't exist. Keeping `library.dynamic`
-     * self-consistent — the target builds `lib<name>.dylib`, the product
-     * references it, and the app embeds it — and resolution is by GUID regardless
-     * of type/name, so no rewrite is needed. */
+    if (pt.find("library.dynamic") != std::string::npos) {
+        /* A dynamic library product becomes a framework, matching the host —
+         * an app's Sparkle-style integration scripts require the product to be
+         * embedded as `<name>.framework` with its binary at `Versions/A/<name>`.
+         * SwiftPM's native form builds `lib<name>.dylib`, so besides the type we
+         * must fix the productReference to `<name>.framework` and drop the `lib`
+         * executable prefix so the framework binary is `<name>`, not `lib<name>`. */
+        prod.o["name"] = JValue::Str(name);
+        prod.o["productTypeIdentifier"] = JValue::Str("com.apple.product-type.framework");
+
+        JObject pr;
+        pr["guid"] = "PRODUCTREF-" + guid;
+        pr["name"] = name + ".framework";
+        pr["type"] = std::string("file");
+        prod.o["productReference"] = JValue::Obj(std::move(pr));
+
+        auto bcs = prod.o.find("buildConfigurations");
+        if (bcs != prod.o.end() && bcs->second.kind == JValue::K::Arr) {
+            for (auto &cfg : bcs->second.a) {
+                if (cfg.kind != JValue::K::Obj) continue;
+                auto bs = cfg.o.find("buildSettings");
+                if (bs == cfg.o.end() || bs->second.kind != JValue::K::Obj) continue;
+                JObject &s = bs->second.o;
+                s["EXECUTABLE_PREFIX"] = std::string("");
+                s["EXECUTABLE_NAME"] = name;
+                s["PRODUCT_NAME"] = name;
+                s["GENERATE_INFOPLIST_FILE"] = std::string("YES");
+                s.erase("INSTALL_PATH");
+            }
+        }
+        return prod;
+    }
+
+    /* Any other product (e.g. executables) is left in SwiftPM's native form,
+     * with just its name normalized. Resolution is by GUID regardless. */
+    prod.o["name"] = JValue::Str(name);
     return prod;
 }
 
