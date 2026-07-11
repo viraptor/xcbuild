@@ -36,6 +36,8 @@
 #include <pbxsetting/Value.h>
 #include <pbxsetting/XC/Config.h>
 #include <plist/Format/Any.h>
+#include <plist/Format/JSON.h>
+#include <plist/Array.h>
 #include <plist/Dictionary.h>
 #include <plist/String.h>
 #include <libutil/Filesystem.h>
@@ -46,6 +48,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <map>
 #include <sstream>
 #include <string>
@@ -221,6 +224,124 @@ std::string md5Hex(uint8_t const *data, size_t n) {
 
 std::string md5Hex(std::string const &s) {
     return md5Hex((uint8_t const *)s.data(), s.size());
+}
+
+/*
+ * Swift package graph, as reported by `swift package dump-package`. Only the
+ * fields needed to synthesize the PIF PACKAGE: project are retained. The manifest
+ * (Package.swift) is executable Swift, so it can't be read statically — the
+ * package's internal target/product structure lives only here, not in the
+ * .xcodeproj (which merely references the package by path).
+ */
+struct PackageTargetInfo {
+    std::string name;
+    std::string type;                     /* "regular", "test", "binary", ... */
+    std::string path;                     /* explicit path, or empty for the convention */
+    std::vector<std::string> dependencies; /* names of sibling package targets */
+    bool hasResources = false;
+};
+
+struct PackageProductInfo {
+    std::string name;
+    bool isLibrary = false;
+    std::vector<std::string> targets;
+};
+
+struct PackageGraph {
+    std::string name;                     /* package name from the manifest */
+    std::string dir;                      /* absolute package directory */
+    std::vector<PackageProductInfo> products;
+    std::vector<PackageTargetInfo> targets;
+
+    PackageTargetInfo const *findTarget(std::string const &n) const {
+        for (auto const &t : targets) if (t.name == n) return &t;
+        return nullptr;
+    }
+};
+
+std::string shellSingleQuote(std::string const &s) {
+    std::string out = "'";
+    for (char c : s) {
+        if (c == '\'') out += "'\\''";
+        else out += c;
+    }
+    out += "'";
+    return out;
+}
+
+/*
+ * Run `swift package dump-package` in the package directory and parse its JSON.
+ * Returns nullopt if the toolchain is unavailable or the manifest can't be
+ * evaluated, so callers degrade gracefully (no package projects) rather than
+ * failing the whole dump.
+ */
+ext::optional<PackageGraph> loadPackageGraph(std::string const &dir) {
+    std::string cmd = "swift package --package-path " + shellSingleQuote(dir) + " dump-package 2>/dev/null";
+    FILE *pipe = popen(cmd.c_str(), "r");
+    if (pipe == nullptr) return ext::nullopt;
+    std::string out;
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), pipe)) > 0) out.append(buf, n);
+    int rc = pclose(pipe);
+    if (rc != 0 || out.empty()) return ext::nullopt;
+
+    std::vector<uint8_t> bytes(out.begin(), out.end());
+    auto result = plist::Format::JSON::Deserialize(bytes, plist::Format::JSON::Create());
+    auto root = plist::CastTo<plist::Dictionary>(result.first.get());
+    if (root == nullptr) return ext::nullopt;
+
+    PackageGraph g;
+    g.dir = dir;
+    if (auto nm = root->value<plist::String>("name")) g.name = nm->value();
+
+    if (auto prods = root->value<plist::Array>("products")) {
+        for (size_t i = 0; i < prods->count(); i++) {
+            auto pd = prods->value<plist::Dictionary>(i);
+            if (pd == nullptr) continue;
+            PackageProductInfo p;
+            if (auto nm = pd->value<plist::String>("name")) p.name = nm->value();
+            if (auto ty = pd->value<plist::Dictionary>("type")) {
+                if (ty->value<plist::Array>("library") != nullptr) p.isLibrary = true;
+            }
+            if (auto ts = pd->value<plist::Array>("targets")) {
+                for (size_t k = 0; k < ts->count(); k++) {
+                    if (auto s = ts->value<plist::String>(k)) p.targets.push_back(s->value());
+                }
+            }
+            g.products.push_back(p);
+        }
+    }
+
+    if (auto tgts = root->value<plist::Array>("targets")) {
+        for (size_t i = 0; i < tgts->count(); i++) {
+            auto td = tgts->value<plist::Dictionary>(i);
+            if (td == nullptr) continue;
+            PackageTargetInfo t;
+            if (auto nm = td->value<plist::String>("name")) t.name = nm->value();
+            if (auto ty = td->value<plist::String>("type")) t.type = ty->value();
+            if (auto pa = td->value<plist::String>("path")) t.path = pa->value();
+            if (auto res = td->value<plist::Array>("resources")) t.hasResources = res->count() > 0;
+            if (auto deps = td->value<plist::Array>("dependencies")) {
+                for (size_t k = 0; k < deps->count(); k++) {
+                    auto dd = deps->value<plist::Dictionary>(k);
+                    if (dd == nullptr) continue;
+                    /* dependency shapes: {"byName":[name,...]}, {"target":[name,...]},
+                     * {"product":[prodName, pkgName,...]}. We only need sibling
+                     * target names (byName/target). */
+                    for (char const *key : {"byName", "target"}) {
+                        if (auto arr = dd->value<plist::Array>(key)) {
+                            if (arr->count() > 0) {
+                                if (auto s = arr->value<plist::String>(0)) t.dependencies.push_back(s->value());
+                            }
+                        }
+                    }
+                }
+            }
+            g.targets.push_back(t);
+        }
+    }
+    return g;
 }
 
 /*
@@ -1003,6 +1124,48 @@ JObject emitTarget(PIFContext const &ctx, Filesystem *filesystem, pbxproj::PBX::
     return t;
 }
 
+/*
+ * Swift package PIF objects. Their GUIDs use the stable string forms the host
+ * (SwiftPM's PIF builder) emits — `PACKAGE:<dir>`, `PACKAGE-PRODUCT:<name>`,
+ * etc. — so the app target's PACKAGE-PRODUCT dependencies resolve. Package
+ * project/target signatures are MD5s of the host's internal JSON, which we
+ * can't reproduce, so we emit a stable placeholder (as for the main project's
+ * `_mod=`); signatures only affect the host's incremental caching, not loading.
+ */
+std::string packageProjectGUID(PackageGraph const &g) {
+    return "PACKAGE:" + g.dir;
+}
+
+std::string packageSignature(std::string const &guid) {
+    return "PACKAGE@v12_hash=" + md5Hex(guid);
+}
+
+JObject emitPackageProject(PackageGraph const &g) {
+    JObject p;
+    std::string guid = packageProjectGUID(g);
+    p["guid"] = guid;
+    p["path"] = g.dir + "/Package.swift";
+    p["projectDirectory"] = g.dir;
+    p["projectName"] = g.name;
+    p["projectIsPackage"] = std::string("true");
+    p["developmentRegion"] = std::string("en");
+    p["defaultConfigurationName"] = std::string("Release");
+    p["buildConfigurations"] = JArray{};
+
+    /* Minimal group tree rooted at the package directory. The host's full tree
+     * enumerates every source and resource file; that refinement is pending. */
+    JObject group;
+    group["guid"] = guid + "::MAINGROUP";
+    group["sourceTree"] = std::string("<absolute>");
+    group["name"] = g.name;
+    group["path"] = g.dir;
+    group["type"] = std::string("group");
+    p["groupTree"] = group;
+
+    p["targets"] = JArray{};
+    return p;
+}
+
 } /* namespace */
 
 int DumpPIFAction::
@@ -1110,6 +1273,34 @@ Run(process::User const *user, process::Context const *processContext, Filesyste
         }
     }
 
+    /*
+     * Discover Swift packages referenced by any project and load their graphs
+     * via `swift package dump-package`. Each becomes a synthesized PACKAGE:
+     * project, mirroring what the host emits. Packages are keyed by their
+     * resolved directory and ordered by it for determinism.
+     */
+    std::vector<PackageGraph> packageGraphs;
+    {
+        std::unordered_set<std::string> seenPackageDirs;
+        std::vector<std::string> packageDirs;
+        for (auto const &project : projects) {
+            for (auto const &ref : project->packageReferences()) {
+                std::string dir = libutil::FSUtil::ResolveRelativePath(ref->relativePath(), project->basePath());
+                if (seenPackageDirs.insert(dir).second) {
+                    packageDirs.push_back(dir);
+                }
+            }
+        }
+        std::sort(packageDirs.begin(), packageDirs.end());
+        for (auto const &dir : packageDirs) {
+            if (auto g = loadPackageGraph(dir)) {
+                packageGraphs.push_back(*g);
+            } else {
+                fprintf(stderr, "warning: unable to load Swift package at '%s' (swift toolchain required); its targets will be omitted from the PIF\n", dir.c_str());
+            }
+        }
+    }
+
     /* Workspace object. */
     {
         JObject ws;
@@ -1121,6 +1312,11 @@ Run(process::User const *user, process::Context const *processContext, Filesyste
         std::vector<std::string> projectSigsForHash;
         for (auto const &p : projects) {
             std::string sig = projectSignature(ctx, *p, projectMod[p.get()]);
+            projectSigsForJSON.push_back(sig);
+            projectSigsForHash.push_back(sig);
+        }
+        for (auto const &g : packageGraphs) {
+            std::string sig = packageSignature(packageProjectGUID(g));
             projectSigsForJSON.push_back(sig);
             projectSigsForHash.push_back(sig);
         }
@@ -1147,6 +1343,15 @@ Run(process::User const *user, process::Context const *processContext, Filesyste
             to["contents"] = emitTarget(ctx, filesystem, *project, *target);
             pif.push_back(to);
         }
+    }
+
+    /* Synthesized Swift package projects (and, later, their targets). */
+    for (auto const &g : packageGraphs) {
+        JObject po;
+        po["type"] = "project";
+        po["signature"] = packageSignature(packageProjectGUID(g));
+        po["contents"] = emitPackageProject(g);
+        pif.push_back(po);
     }
 
     JSONOut j;
