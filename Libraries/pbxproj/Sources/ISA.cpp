@@ -32,6 +32,7 @@ char const * const PBXTargetDependency = "PBXTargetDependency";
 char const * const PBXVariantGroup = "PBXVariantGroup";
 char const * const XCBuildConfiguration = "XCBuildConfiguration";
 char const * const XCConfigurationList = "XCConfigurationList";
+char const * const XCSwiftPackageProductDependency = "XCSwiftPackageProductDependency";
 char const * const XCVersionGroup = "XCVersionGroup";
 
 } }

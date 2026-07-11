@@ -11,6 +11,7 @@
 #include <pbxproj/PBX/ReferenceProxy.h>
 #include <pbxproj/PBX/Group.h>
 #include <pbxproj/PBX/VariantGroup.h>
+#include <pbxproj/PBX/SwiftPackageProductDependency.h>
 #include <pbxproj/XC/VersionGroup.h>
 #include <pbxproj/Context.h>
 #include <pbxsetting/Type.h>
@@ -47,12 +48,14 @@ parse(Context &context, plist::Dictionary const *dict, std::unordered_set<std::s
     std::string GID;
     std::string VaGID;
     std::string VrGID;
+    std::string PRID;
 
     auto FR  = context.indirect <FileReference> (&unpack, "fileRef", &FRID);
     auto RP  = context.indirect <ReferenceProxy> (&unpack, "fileRef", &RPID);
     auto G   = context.indirect <Group> (&unpack, "fileRef", &GID);
     auto VaG = context.indirect <VariantGroup> (&unpack, "fileRef", &VaGID);
     auto VrG = context.indirect <XC::VersionGroup> (&unpack, "fileRef", &VrGID);
+    auto PR  = context.indirect <SwiftPackageProductDependency> (&unpack, "productRef", &PRID);
     auto S   = unpack.cast <plist::Dictionary> ("settings");
 
     if (!unpack.complete(check)) {
@@ -74,6 +77,10 @@ parse(Context &context, plist::Dictionary const *dict, std::unordered_set<std::s
     } else if (VrG != nullptr) {
         XC::VersionGroup::shared_ptr versionGroup = context.parseObject(context.versionGroups, VrGID, VrG);
         _fileRef = std::static_pointer_cast <GroupItem> (versionGroup);
+    }
+
+    if (PR != nullptr) {
+        _productRef = context.parseObject(context.swiftPackageProductDependencies, PRID, PR);
     }
 
     if (S != nullptr) {

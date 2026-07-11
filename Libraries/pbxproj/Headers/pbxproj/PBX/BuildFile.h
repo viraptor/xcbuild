@@ -13,15 +13,18 @@
 
 namespace pbxproj { namespace PBX {
 
+class SwiftPackageProductDependency;
+
 class BuildFile : public Object {
 public:
     typedef std::shared_ptr <BuildFile> shared_ptr;
     typedef std::vector <shared_ptr> vector;
 
 private:
-    GroupItem::shared_ptr       _fileRef;
-    std::vector<std::string>    _compilerFlags;
-    std::vector<std::string>    _attributes;
+    GroupItem::shared_ptr                          _fileRef;
+    std::shared_ptr<SwiftPackageProductDependency> _productRef;
+    std::vector<std::string>                       _compilerFlags;
+    std::vector<std::string>                       _attributes;
 
 public:
     BuildFile();
@@ -30,6 +33,8 @@ public:
 public:
     inline GroupItem::shared_ptr const &fileRef() const
     { return _fileRef; }
+    inline std::shared_ptr<SwiftPackageProductDependency> const &productRef() const
+    { return _productRef; }
 
 public:
     inline std::vector<std::string> const &compilerFlags() const

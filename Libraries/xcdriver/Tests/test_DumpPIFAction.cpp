@@ -216,6 +216,41 @@ ExtractValues(std::string const &json, std::string const &key)
 }
 
 /*
+ * Run `-dumpPIF` against a project.pbxproj held in memory and return the
+ * emitted PIF JSON as a string.
+ */
+static std::string
+DumpPIF(char const *pbxproj)
+{
+    MemoryFilesystem filesystem = MemoryFilesystem({
+        MemoryFilesystem::Entry::Directory("Workspace", {
+            MemoryFilesystem::Entry::Directory("Project.xcodeproj", {
+                MemoryFilesystem::Entry::File("project.pbxproj", Contents(pbxproj)),
+            }),
+        }),
+        MemoryFilesystem::Entry::Directory("out", { }),
+    });
+
+    Options options;
+    auto parsed = libutil::Options::Parse<Options>(&options, {
+        "-project", filesystem.path("Workspace/Project.xcodeproj"),
+        "-dumpPIF", filesystem.path("out/pif.json"),
+    });
+    EXPECT_TRUE(parsed.first) << parsed.second;
+
+    process::DefaultUser user;
+    process::MemoryContext processContext = process::MemoryContext(
+        "xcodebuild", filesystem.path(""), { },
+        std::unordered_map<std::string, std::string>());
+
+    EXPECT_EQ(0, DumpPIFAction::Run(&user, &processContext, &filesystem, options));
+
+    std::vector<uint8_t> bytes;
+    EXPECT_TRUE(filesystem.read(&bytes, filesystem.path("out/pif.json")));
+    return std::string(bytes.begin(), bytes.end());
+}
+
+/*
  * Regression test for an implicit intra-project product link. The LuaSkin
  * target's Frameworks phase links liblua.a (the lua target's product); the PIF
  * generator must translate that build file's fileReference into a
@@ -276,4 +311,147 @@ TEST(DumpPIFAction, ImplicitProductLinkTargetReference)
         /* And it must resolve to a real object GUID in the PIF. */
         EXPECT_EQ(1u, guidSet.count(ref)) << "targetReference does not resolve to any registered GUID: " << ref;
     }
+}
+
+/*
+ * A project whose single app target links a Swift package product. The link is
+ * expressed by a PBXBuildFile carrying a `productRef` (an
+ * XCSwiftPackageProductDependency) rather than a `fileRef`, and the same product
+ * is embedded via a Copy Files phase. There is no explicit
+ * packageProductDependencies array on the target — the dependency is implicit,
+ * inferred from the linked product, exactly as Xcode's own projects often store
+ * it.
+ */
+static char const kPackageProductPBXProj[] = R"PBX(// !$*UTF8*$!
+{
+    archiveVersion = 1;
+    classes = { };
+    objectVersion = 46;
+    objects = {
+
+        PROJECT0000000000000001 = {
+            isa = PBXProject;
+            buildConfigurationList = CFGLISTPROJECT000000001;
+            mainGroup = GROUPMAIN00000000000001;
+            targets = ( TARGETAPP00000000000001 );
+        };
+
+        GROUPMAIN00000000000001 = {
+            isa = PBXGroup;
+            children = ( FILEAPP0000000000000001 );
+            sourceTree = "<group>";
+        };
+
+        FILEAPP0000000000000001 = {
+            isa = PBXFileReference;
+            explicitFileType = wrapper.application;
+            path = App.app;
+            includeInIndex = 0;
+            sourceTree = BUILT_PRODUCTS_DIR;
+        };
+
+        SPPD00000000000000001 = {
+            isa = XCSwiftPackageProductDependency;
+            productName = MyLib;
+        };
+
+        BUILDFILELINK00000001 = {
+            isa = PBXBuildFile;
+            productRef = SPPD00000000000000001;
+        };
+
+        BUILDFILEEMBED0000001 = {
+            isa = PBXBuildFile;
+            productRef = SPPD00000000000000001;
+        };
+
+        PHASESRC000000000001 = {
+            isa = PBXSourcesBuildPhase;
+            buildActionMask = 2147483647;
+            files = ( );
+            runOnlyForDeploymentPostprocessing = 0;
+        };
+
+        PHASEFRAMEWORKS00001 = {
+            isa = PBXFrameworksBuildPhase;
+            buildActionMask = 2147483647;
+            files = ( BUILDFILELINK00000001 );
+            runOnlyForDeploymentPostprocessing = 0;
+        };
+
+        PHASEEMBED0000000001 = {
+            isa = PBXCopyFilesBuildPhase;
+            buildActionMask = 2147483647;
+            dstPath = "";
+            dstSubfolderSpec = 10;
+            files = ( BUILDFILEEMBED0000001 );
+            runOnlyForDeploymentPostprocessing = 0;
+        };
+
+        TARGETAPP00000000000001 = {
+            isa = PBXNativeTarget;
+            buildConfigurationList = CFGLISTAPP0000000000001;
+            buildPhases = (
+                PHASESRC000000000001,
+                PHASEFRAMEWORKS00001,
+                PHASEEMBED0000000001,
+            );
+            buildRules = ( );
+            dependencies = ( );
+            name = App;
+            productName = App;
+            productReference = FILEAPP0000000000000001;
+            productType = "com.apple.product-type.application";
+        };
+
+        CFGBUILDPROJECT0000001 = { isa = XCBuildConfiguration; buildSettings = { }; name = Release; };
+        CFGBUILDAPP000000001 = { isa = XCBuildConfiguration; buildSettings = { }; name = Release; };
+
+        CFGLISTPROJECT000000001 = {
+            isa = XCConfigurationList;
+            buildConfigurations = ( CFGBUILDPROJECT0000001 );
+            defaultConfigurationIsVisible = 0;
+            defaultConfigurationName = Release;
+        };
+
+        CFGLISTAPP0000000000001 = {
+            isa = XCConfigurationList;
+            buildConfigurations = ( CFGBUILDAPP000000001 );
+            defaultConfigurationIsVisible = 0;
+            defaultConfigurationName = Release;
+        };
+
+    };
+    rootObject = PROJECT0000000000000001;
+}
+)PBX";
+
+/*
+ * Regression test for Swift package product links. A build file with a
+ * `productRef` must be emitted (not dropped) as a `PACKAGE-PRODUCT:<name>`
+ * target reference, and the linked product must appear once in the target's
+ * dependencies. Before this was handled the productRef build files were
+ * silently skipped and the dependency list came out empty.
+ */
+TEST(DumpPIFAction, SwiftPackageProductDependency)
+{
+    std::string json = DumpPIF(kPackageProductPBXProj);
+
+    /* The productRef build files (link + embed) both become PACKAGE-PRODUCT
+     * target references rather than being dropped. */
+    std::vector<std::string> targetRefs = ExtractValues(json, "targetReference");
+    ASSERT_EQ(2u, targetRefs.size());
+    for (auto const &ref : targetRefs) {
+        EXPECT_EQ("PACKAGE-PRODUCT:MyLib", ref);
+    }
+
+    /* The target gains exactly one PACKAGE-PRODUCT dependency, deduplicated
+     * across the link and embed phases — its guid is the only guid value equal
+     * to the synthetic PACKAGE-PRODUCT identifier. */
+    std::vector<std::string> guids = ExtractValues(json, "guid");
+    int pkgDeps = 0;
+    for (auto const &g : guids) {
+        if (g == "PACKAGE-PRODUCT:MyLib") pkgDeps++;
+    }
+    EXPECT_EQ(1, pkgDeps) << "expected exactly one PACKAGE-PRODUCT:MyLib dependency guid";
 }

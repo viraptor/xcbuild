@@ -21,6 +21,7 @@
 #include <pbxproj/PBX/ResourcesBuildPhase.h>
 #include <pbxproj/PBX/ShellScriptBuildPhase.h>
 #include <pbxproj/PBX/SourcesBuildPhase.h>
+#include <pbxproj/PBX/SwiftPackageProductDependency.h>
 #include <pbxproj/PBX/Target.h>
 #include <pbxproj/PBX/TargetDependency.h>
 #include <pbxproj/PBX/VariantGroup.h>
@@ -441,6 +442,21 @@ productFileToTarget(PIFContext const &ctx, pbxproj::PBX::Project const &project)
 JArray emitBuildFiles(PIFContext const &ctx, pbxproj::PBX::Project const &project, pbxproj::PBX::BuildPhase const &phase, std::unordered_map<std::string, std::string> const &prodToTarget) {
     JArray arr;
     for (auto const &bf : phase.files()) {
+        /* A build file that links a Swift package product carries a productRef
+         * (XCSwiftPackageProductDependency) instead of a fileRef. Emit it with
+         * a `PACKAGE-PRODUCT:<name>` target reference, matching the host. Its
+         * guid is the bare MD5 of the package product dependency's identifier —
+         * no project-signature prefix — so the same product linked from several
+         * phases (e.g. Frameworks and Embed Frameworks) shares one guid. */
+        if (bf->productRef() != nullptr) {
+            JObject o;
+            std::string id = bf->productRef()->blueprintIdentifier();
+            o["guid"] = id.empty() ? std::string(32, '0') : md5Hex(id);
+            o["targetReference"] = "PACKAGE-PRODUCT:" + bf->productRef()->productName();
+            arr.push_back(o);
+            continue;
+        }
+
         /* Skip orphaned build files with no file or target reference — pbxproj
          * leaves these around as `(null)` entries when the underlying file
          * reference was deleted. The PIF loader rejects BuildFile dictionaries
@@ -791,6 +807,26 @@ JObject emitTarget(PIFContext const &ctx, pbxproj::PBX::Project const &project, 
             d["name"] = dep->name();
         }
         deps.push_back(d);
+    }
+
+    /* Swift package products linked in the Frameworks phase become implicit
+     * PACKAGE-PRODUCT dependencies, in link order (deduplicated). The host
+     * synthesizes these from the productRef build files — the pbxproj often
+     * carries no explicit packageProductDependencies array — so we do the same.
+     * Only the linking (Frameworks) phase contributes a dependency; embedding
+     * (Copy Files) phases reuse the same product without adding another. */
+    std::unordered_set<std::string> seenPackageProducts;
+    for (auto const &phase : target.buildPhases()) {
+        if (phase->type() != pbxproj::PBX::BuildPhase::Type::Frameworks) continue;
+        for (auto const &bf : phase->files()) {
+            if (bf->productRef() == nullptr) continue;
+            std::string const &name = bf->productRef()->productName();
+            if (!seenPackageProducts.insert(name).second) continue;
+            JObject d;
+            d["guid"] = "PACKAGE-PRODUCT:" + name;
+            d["name"] = name;
+            deps.push_back(d);
+        }
     }
     t["dependencies"] = deps;
 

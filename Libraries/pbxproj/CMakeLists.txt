@@ -35,6 +35,7 @@ add_library(pbxproj
             Sources/PBX/VariantGroup.cpp
             Sources/PBX/ContainerItemProxy.cpp
             Sources/PBX/TargetDependency.cpp
+            Sources/PBX/SwiftPackageProductDependency.cpp
             Sources/XC/BuildConfiguration.cpp
             Sources/XC/ConfigurationList.cpp
             Sources/XC/VersionGroup.cpp

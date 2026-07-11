@@ -38,6 +38,7 @@ class AggregateTarget;
 class LegacyTarget;
 class ContainerItemProxy;
 class TargetDependency;
+class SwiftPackageProductDependency;
 class BuildFile;
 class BuildRule;
 class HeadersBuildPhase;
@@ -83,6 +84,7 @@ public:
     std::unordered_map <std::string, std::shared_ptr <PBX::AggregateTarget>>       aggregateTargets;
     std::unordered_map <std::string, std::shared_ptr <PBX::LegacyTarget>>          legacyTargets;
     std::unordered_map <std::string, std::shared_ptr <PBX::TargetDependency>>      targetDependencies;
+    std::unordered_map <std::string, std::shared_ptr <PBX::SwiftPackageProductDependency>> swiftPackageProductDependencies;
     std::unordered_map <std::string, std::shared_ptr <PBX::ContainerItemProxy>>    containerItemProxies;
     std::unordered_map <std::string, std::shared_ptr <PBX::BuildFile>>             buildFiles;
     std::unordered_map <std::string, std::shared_ptr <PBX::BuildRule>>             buildRules;
@@ -115,6 +117,7 @@ public:
         variantGroups.clear();
         nativeTargets.clear();
         targetDependencies.clear();
+        swiftPackageProductDependencies.clear();
         containerItemProxies.clear();
         buildFiles.clear();
         buildRules.clear();
