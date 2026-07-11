@@ -38,7 +38,10 @@
 #include <plist/Format/Any.h>
 #include <plist/Format/JSON.h>
 #include <plist/Array.h>
+#include <plist/Boolean.h>
 #include <plist/Dictionary.h>
+#include <plist/Integer.h>
+#include <plist/Real.h>
 #include <plist/String.h>
 #include <libutil/Filesystem.h>
 #include <libutil/FSUtil.h>
@@ -226,42 +229,6 @@ std::string md5Hex(std::string const &s) {
     return md5Hex((uint8_t const *)s.data(), s.size());
 }
 
-/*
- * Swift package graph, as reported by `swift package dump-package`. Only the
- * fields needed to synthesize the PIF PACKAGE: project are retained. The manifest
- * (Package.swift) is executable Swift, so it can't be read statically — the
- * package's internal target/product structure lives only here, not in the
- * .xcodeproj (which merely references the package by path).
- */
-struct PackageTargetInfo {
-    std::string name;
-    std::string type;                     /* "regular", "test", "binary", ... */
-    std::string path;                     /* explicit path, or empty for the convention */
-    std::vector<std::string> dependencies; /* names of sibling package targets */
-    bool hasResources = false;
-};
-
-struct PackageProductInfo {
-    std::string name;
-    bool isLibrary = false;
-    std::string libraryKind;   /* "static", "dynamic", "automatic", or empty */
-    std::vector<std::string> targets;
-
-    bool isDynamic() const { return libraryKind == "dynamic"; }
-};
-
-struct PackageGraph {
-    std::string name;                     /* package name from the manifest */
-    std::string dir;                      /* absolute package directory */
-    std::vector<PackageProductInfo> products;
-    std::vector<PackageTargetInfo> targets;
-
-    PackageTargetInfo const *findTarget(std::string const &n) const {
-        for (auto const &t : targets) if (t.name == n) return &t;
-        return nullptr;
-    }
-};
-
 std::string shellSingleQuote(std::string const &s) {
     std::string out = "'";
     for (char c : s) {
@@ -272,14 +239,70 @@ std::string shellSingleQuote(std::string const &s) {
     return out;
 }
 
+/* Recursively convert a parsed plist value tree into our JValue tree, so PIF
+ * fragments SwiftPM emits can be re-serialized through the same writer. */
+JValue plistToJValue(plist::Object const *o) {
+    if (o == nullptr) return JValue();
+    if (auto d = plist::CastTo<plist::Dictionary>(o)) {
+        JObject obj;
+        for (size_t i = 0; i < d->count(); i++) {
+            std::string k = d->key(i);
+            obj[k] = plistToJValue(d->value(k));
+        }
+        return JValue::Obj(std::move(obj));
+    }
+    if (auto a = plist::CastTo<plist::Array>(o)) {
+        JArray arr;
+        for (size_t i = 0; i < a->count(); i++) arr.push_back(plistToJValue(a->value(i)));
+        return JValue::Arr(std::move(arr));
+    }
+    if (auto s = plist::CastTo<plist::String>(o)) return JValue::Str(s->value());
+    if (auto b = plist::CastTo<plist::Boolean>(o)) return JValue(b->value());
+    if (auto n = plist::CastTo<plist::Integer>(o)) return JValue((long long)n->value());
+    if (auto r = plist::CastTo<plist::Real>(o)) return JValue((long long)r->value());
+    return JValue();
+}
+
+/* Drop the redundant `name` (a copy of the absolute path) that SwiftPM emits on
+ * file nodes of a package's group tree; the host omits it. */
+void stripPackageFileNodeNames(JValue &node) {
+    if (node.kind != JValue::K::Obj) return;
+    auto ty = node.o.find("type");
+    if (ty != node.o.end() && ty->second.kind == JValue::K::Str &&
+        (ty->second.s == "file" || ty->second.s == "fileReference")) {
+        node.o.erase("name");
+    }
+    auto ch = node.o.find("children");
+    if (ch != node.o.end() && ch->second.kind == JValue::K::Arr) {
+        for (auto &c : ch->second.a) stripPackageFileNodeNames(c);
+    }
+}
+
+struct SplicedPackageObject {
+    bool isProject;
+    std::string guid;
+    JValue contents;
+};
+
 /*
- * Run `swift package dump-package` in the package directory and parse its JSON.
- * Returns nullopt if the toolchain is unavailable or the manifest can't be
- * evaluated, so callers degrade gracefully (no package projects) rather than
- * failing the whole dump.
+ * Obtain a Swift package's PIF directly from SwiftPM
+ * (`swift package --build-system swiftbuild dump-pif`) and adapt it to the
+ * host's app-embedded scheme. SwiftPM is the source of truth for the package's
+ * group tree, build phases, and build settings, so we splice its output rather
+ * than reproduce the synthesis. Adaptation:
+ *   - remap the project GUID from SwiftPM's `PACKAGE:<identity>` to the host's
+ *     `PACKAGE:<absolute-dir>`, and each product GUID
+ *     `PACKAGE-PRODUCT:<identity>_<module>.<product>` to `PACKAGE-PRODUCT:<product>`,
+ *     rewriting every reference (done as text replacement before re-parsing);
+ *   - drop SwiftPM's standalone-only objects (its Workspace, the AGGREGATE
+ *     project, and the ALL-*-TESTS targets);
+ *   - strip the redundant file-node names from the group tree.
+ * Returns nullopt if the toolchain is unavailable, so callers degrade to no
+ * package projects rather than failing.
  */
-ext::optional<PackageGraph> loadPackageGraph(std::string const &dir) {
-    std::string cmd = "swift package --package-path " + shellSingleQuote(dir) + " dump-package 2>/dev/null";
+ext::optional<std::vector<SplicedPackageObject>> loadPackagePIF(std::string const &dir) {
+    std::string cmd = "swift package --package-path " + shellSingleQuote(dir) +
+                      " --build-system swiftbuild dump-pif 2>/dev/null";
     FILE *pipe = popen(cmd.c_str(), "r");
     if (pipe == nullptr) return ext::nullopt;
     std::string out;
@@ -289,67 +312,80 @@ ext::optional<PackageGraph> loadPackageGraph(std::string const &dir) {
     int rc = pclose(pipe);
     if (rc != 0 || out.empty()) return ext::nullopt;
 
+    /* First parse: discover the GUIDs that need remapping. */
     std::vector<uint8_t> bytes(out.begin(), out.end());
-    auto result = plist::Format::JSON::Deserialize(bytes, plist::Format::JSON::Create());
-    auto root = plist::CastTo<plist::Dictionary>(result.first.get());
-    if (root == nullptr) return ext::nullopt;
+    auto parsed = plist::Format::JSON::Deserialize(bytes, plist::Format::JSON::Create());
+    auto arr = plist::CastTo<plist::Array>(parsed.first.get());
+    if (arr == nullptr) return ext::nullopt;
 
-    PackageGraph g;
-    g.dir = dir;
-    if (auto nm = root->value<plist::String>("name")) g.name = nm->value();
-
-    if (auto prods = root->value<plist::Array>("products")) {
-        for (size_t i = 0; i < prods->count(); i++) {
-            auto pd = prods->value<plist::Dictionary>(i);
-            if (pd == nullptr) continue;
-            PackageProductInfo p;
-            if (auto nm = pd->value<plist::String>("name")) p.name = nm->value();
-            if (auto ty = pd->value<plist::Dictionary>("type")) {
-                if (auto lib = ty->value<plist::Array>("library")) {
-                    p.isLibrary = true;
-                    if (lib->count() > 0) {
-                        if (auto k = lib->value<plist::String>(0)) p.libraryKind = k->value();
-                    }
-                }
-            }
-            if (auto ts = pd->value<plist::Array>("targets")) {
-                for (size_t k = 0; k < ts->count(); k++) {
-                    if (auto s = ts->value<plist::String>(k)) p.targets.push_back(s->value());
-                }
-            }
-            g.products.push_back(p);
+    std::vector<std::pair<std::string, std::string>> remaps; /* from -> to */
+    for (size_t i = 0; i < arr->count(); i++) {
+        auto o = arr->value<plist::Dictionary>(i);
+        if (o == nullptr) continue;
+        auto type = o->value<plist::String>("type");
+        auto contents = o->value<plist::Dictionary>("contents");
+        if (type == nullptr || contents == nullptr) continue;
+        auto guidS = contents->value<plist::String>("guid");
+        if (guidS == nullptr) continue;
+        std::string guid = guidS->value();
+        if (type->value() == "project" && guid.rfind("PACKAGE:", 0) == 0) {
+            remaps.emplace_back(guid, "PACKAGE:" + dir);
+        } else if (type->value() == "target" && guid.rfind("PACKAGE-PRODUCT:", 0) == 0) {
+            /* SwiftPM's product GUID is `PACKAGE-PRODUCT:<identity>_<module>.<product>`
+             * and its name is `<product>-product`; the host uses just
+             * `PACKAGE-PRODUCT:<product>`. Recover the product name from the guid
+             * (after the final dot), matching how the consuming app references it. */
+            auto dot = guid.rfind('.');
+            std::string product = (dot == std::string::npos)
+                ? guid.substr(std::string("PACKAGE-PRODUCT:").size())
+                : guid.substr(dot + 1);
+            remaps.emplace_back(guid, "PACKAGE-PRODUCT:" + product);
+        }
+    }
+    if (remaps.empty()) return ext::nullopt;
+    /* Replace longer GUIDs first so no remap key is a prefix of another. */
+    std::sort(remaps.begin(), remaps.end(), [](std::pair<std::string, std::string> const &a, std::pair<std::string, std::string> const &b) {
+        return a.first.size() > b.first.size();
+    });
+    for (auto const &r : remaps) {
+        size_t pos = 0;
+        while ((pos = out.find(r.first, pos)) != std::string::npos) {
+            out.replace(pos, r.first.size(), r.second);
+            pos += r.second.size();
         }
     }
 
-    if (auto tgts = root->value<plist::Array>("targets")) {
-        for (size_t i = 0; i < tgts->count(); i++) {
-            auto td = tgts->value<plist::Dictionary>(i);
-            if (td == nullptr) continue;
-            PackageTargetInfo t;
-            if (auto nm = td->value<plist::String>("name")) t.name = nm->value();
-            if (auto ty = td->value<plist::String>("type")) t.type = ty->value();
-            if (auto pa = td->value<plist::String>("path")) t.path = pa->value();
-            if (auto res = td->value<plist::Array>("resources")) t.hasResources = res->count() > 0;
-            if (auto deps = td->value<plist::Array>("dependencies")) {
-                for (size_t k = 0; k < deps->count(); k++) {
-                    auto dd = deps->value<plist::Dictionary>(k);
-                    if (dd == nullptr) continue;
-                    /* dependency shapes: {"byName":[name,...]}, {"target":[name,...]},
-                     * {"product":[prodName, pkgName,...]}. We only need sibling
-                     * target names (byName/target). */
-                    for (char const *key : {"byName", "target"}) {
-                        if (auto arr = dd->value<plist::Array>(key)) {
-                            if (arr->count() > 0) {
-                                if (auto s = arr->value<plist::String>(0)) t.dependencies.push_back(s->value());
-                            }
-                        }
-                    }
-                }
-            }
-            g.targets.push_back(t);
+    /* Second parse: the remapped PIF. */
+    std::vector<uint8_t> bytes2(out.begin(), out.end());
+    auto parsed2 = plist::Format::JSON::Deserialize(bytes2, plist::Format::JSON::Create());
+    auto arr2 = plist::CastTo<plist::Array>(parsed2.first.get());
+    if (arr2 == nullptr) return ext::nullopt;
+
+    std::vector<SplicedPackageObject> result;
+    for (size_t i = 0; i < arr2->count(); i++) {
+        auto o = arr2->value<plist::Dictionary>(i);
+        if (o == nullptr) continue;
+        auto type = o->value<plist::String>("type");
+        auto contents = o->value<plist::Dictionary>("contents");
+        if (type == nullptr || contents == nullptr) continue;
+        auto guidS = contents->value<plist::String>("guid");
+        if (guidS == nullptr) continue;
+        std::string guid = guidS->value();
+        std::string t = type->value();
+
+        if (t == "workspace") continue;
+        if (guid == "AGGREGATE" || guid == "ALL-INCLUDING-TESTS" || guid == "ALL-EXCLUDING-TESTS") continue;
+        bool isProject = (t == "project");
+        if (!isProject && t != "target") continue;
+
+        JValue jc = plistToJValue(contents);
+        if (isProject) {
+            auto gt = jc.o.find("groupTree");
+            if (gt != jc.o.end()) stripPackageFileNodeNames(gt->second);
         }
+        result.push_back({isProject, guid, std::move(jc)});
     }
-    return g;
+    return result;
 }
 
 /*
@@ -1133,403 +1169,17 @@ JObject emitTarget(PIFContext const &ctx, Filesystem *filesystem, pbxproj::PBX::
 }
 
 /*
- * Swift package PIF objects. Their GUIDs use the stable string forms the host
- * (SwiftPM's PIF builder) emits — `PACKAGE:<dir>`, `PACKAGE-PRODUCT:<name>`,
- * etc. — so the app target's PACKAGE-PRODUCT dependencies resolve. Package
- * project/target signatures are MD5s of the host's internal JSON, which we
- * can't reproduce, so we emit a stable placeholder (as for the main project's
- * `_mod=`); signatures only affect the host's incremental caching, not loading.
+ * Signatures for spliced package objects. The host's are MD5s of its internal
+ * NSJSONSerialization output, which we can't reproduce, so we emit stable
+ * placeholders keyed on the GUID (as for the main project's `_mod=`);
+ * signatures only affect the host's incremental caching, not loading.
  */
-std::string packageProjectGUID(PackageGraph const &g) {
-    return "PACKAGE:" + g.dir;
-}
-
 std::string packageSignature(std::string const &guid) {
     return "PACKAGE@v12_hash=" + md5Hex(guid);
 }
 
 std::string packageTargetSignature(std::string const &guid) {
     return "TARGET@v12_hash=" + md5Hex(guid);
-}
-
-/*
- * The `-dynamic` variant GUID suffix SwiftPM appends: "-" + the module name's
- * CoreFoundation string hash (NSString.hash) rendered as signed hex, + "-dynamic".
- * The hash is negative for most names, so String(_,radix:16) prepends a '-',
- * producing the doubled dash `name--HEX-dynamic`. Reimplements
- * CFStringHashCharacters (ASCII/BMP names only). See the spm-dynamic-target-guid
- * reference for the derivation.
- */
-std::string cfStringHashHex(std::string const &s) {
-    uint64_t result = (uint64_t)s.size();
-    size_t L = s.size();
-    unsigned char const *u = (unsigned char const *)s.data();
-    size_t i = 0, end4 = L & ~size_t(3);
-    while (i < end4) {
-        result = result * 67503105ULL + (uint64_t)u[i] * 16974593ULL + (uint64_t)u[i + 1] * 66049ULL + (uint64_t)u[i + 2] * 257ULL + (uint64_t)u[i + 3];
-        i += 4;
-    }
-    while (i < L) { result = result * 257ULL + u[i]; ++i; }
-    result += result << (L & 31);
-
-    bool neg = (result >> 63) != 0;
-    uint64_t mag = neg ? (uint64_t)0 - result : result;
-    char buf[17];
-    int p = 16;
-    buf[16] = '\0';
-    if (mag == 0) buf[--p] = '0';
-    while (mag) { int d = (int)(mag & 0xF); buf[--p] = (char)(d < 10 ? '0' + d : 'A' + d - 10); mag >>= 4; }
-    std::string hex(buf + p);
-    return neg ? ("-" + hex) : hex;
-}
-
-std::string packageDynamicTargetGUID(std::string const &moduleName) {
-    return "PACKAGE-TARGET:" + moduleName + "-" + cfStringHashHex(moduleName) + "-dynamic";
-}
-
-/* A package target's two build configurations (Debug, Release) sharing one
- * settings map, matching the host's per-target config shape. */
-JArray packageBuildConfigurations(std::string const &guid, JObject const &settings) {
-    JArray configs;
-    char const *names[2] = {"Debug", "Release"};
-    for (int i = 0; i < 2; i++) {
-        JObject c;
-        c["guid"] = guid + "::BUILDCONFIG_" + std::to_string(i);
-        c["name"] = std::string(names[i]);
-        c["buildSettings"] = settings;
-        JObject imparted;
-        imparted["buildSettings"] = JObject{};
-        c["impartedBuildProperties"] = imparted;
-        configs.push_back(c);
-    }
-    return configs;
-}
-
-JObject packageProductReference(std::string const &targetGUID, std::string const &name) {
-    JObject pr;
-    pr["guid"] = "PRODUCTREF-" + targetGUID;
-    pr["name"] = name;
-    /* Package target product references use "file" (not "product" as native
-     * PBX targets do), matching the host. */
-    pr["type"] = std::string("file");
-    return pr;
-}
-
-JObject packageDependency(std::string const &guid) {
-    JObject d;
-    d["guid"] = guid;
-    d["platformFilters"] = JArray{};
-    return d;
-}
-
-struct EmittedPackage {
-    JObject project;
-    std::vector<std::pair<std::string, JObject>> targets; /* signature, contents */
-};
-
-/*
- * Emit a Swift package's PIF project and its targets. The host models each
- * package product/target as several PIF targets:
- *   PACKAGE-PRODUCT:<product>   the linkable product the app depends on
- *   PACKAGE-TARGET:<module>     the module compiled to an object file (.o)
- *   PACKAGE-TARGET:<module>--<hash>-dynamic   dynamic (framework) variant
- *   PACKAGE-RESOURCE:<module>   resource bundle, when the module has resources
- *
- * PACKAGE-PRODUCT is reproduced faithfully (it's small and fully derivable, and
- * it's what the consuming app links). The compiled-module targets carry correct
- * identity/wiring (GUIDs, product references, dependencies, dynamic-variant
- * link) and a derivable subset of build settings; the host synthesizes ~30 more
- * settings and a full per-file group tree from the manifest, which are not yet
- * reproduced (build phases are emitted empty). This is enough for every
- * PACKAGE-* reference in the workspace to resolve.
- */
-EmittedPackage emitPackage(PackageGraph const &g) {
-    EmittedPackage out;
-    std::string projGUID = packageProjectGUID(g);
-
-    auto addTarget = [&](JObject const &contents) {
-        std::string guid = contents.at("guid").s;
-        out.targets.emplace_back(packageTargetSignature(guid), contents);
-    };
-
-    /* Determine which modules to emit: those backing an emitted library product.
-     * Modules that back a `.dynamic` library product are the framework itself,
-     * so they get no separate dynamic variant. */
-    std::vector<std::string> moduleNames;
-    std::unordered_set<std::string> moduleSet;
-    std::unordered_set<std::string> dynamicModules;
-    for (auto const &prod : g.products) {
-        if (!prod.isLibrary) continue;
-        for (auto const &tn : prod.targets) {
-            if (g.findTarget(tn) != nullptr && moduleSet.insert(tn).second) {
-                moduleNames.push_back(tn);
-            }
-            if (prod.isDynamic()) dynamicModules.insert(tn);
-        }
-    }
-
-    /* Direct sibling-module dependencies of a target (those that are emitted
-     * modules, i.e. excluding binary/system targets). */
-    auto directModuleDeps = [&](PackageTargetInfo const *ti) {
-        std::vector<std::string> r;
-        if (ti != nullptr) {
-            for (auto const &d : ti->dependencies) {
-                if (moduleSet.count(d)) r.push_back(d);
-            }
-        }
-        return r;
-    };
-
-    /* Transitive sibling-module dependencies reachable from a starting set,
-     * excluding the starting set itself, in breadth-first order. */
-    auto transitiveModuleDeps = [&](std::vector<std::string> const &start) {
-        std::vector<std::string> order;
-        std::unordered_set<std::string> seen(start.begin(), start.end());
-        std::vector<std::string> work(start.begin(), start.end());
-        for (size_t w = 0; w < work.size(); w++) {
-            auto const *t = g.findTarget(work[w]);
-            if (t == nullptr) continue;
-            for (auto const &d : t->dependencies) {
-                if (moduleSet.count(d) && seen.insert(d).second) {
-                    order.push_back(d);
-                    work.push_back(d);
-                }
-            }
-        }
-        return order;
-    };
-
-    /* PACKAGE-PRODUCT targets. A static/automatic library product becomes a thin
-     * `packageProduct` linkable; a dynamic library product is a real framework
-     * target that links its module. */
-    for (auto const &prod : g.products) {
-        if (!prod.isLibrary) continue;
-        std::string guid = "PACKAGE-PRODUCT:" + prod.name;
-
-        JObject t;
-        t["guid"] = guid;
-        t["name"] = prod.name;
-        t["approvedByUser"] = std::string("true");
-        t["customTasks"] = JArray{};
-
-        JArray deps;
-        JArray frameworkFiles;
-        int idx = 0;
-        std::vector<std::string> ownTargets;
-        for (auto const &tn : prod.targets) {
-            auto const *ti = g.findTarget(tn);
-            if (ti == nullptr) continue;
-            ownTargets.push_back(tn);
-            deps.push_back(packageDependency("PACKAGE-TARGET:" + tn));
-            if (ti->hasResources) {
-                deps.push_back(packageDependency("PACKAGE-RESOURCE:" + tn));
-            }
-            JObject bf;
-            bf["guid"] = guid + "::BUILDPHASE_0::" + std::to_string(idx++);
-            bf["platformFilters"] = JArray{};
-            bf["targetReference"] = "PACKAGE-TARGET:" + tn;
-            frameworkFiles.push_back(bf);
-        }
-        /* The product also depends on the modules its own targets pull in
-         * transitively (linked through them, not in this frameworks phase). */
-        for (auto const &dep : transitiveModuleDeps(ownTargets)) {
-            deps.push_back(packageDependency("PACKAGE-TARGET:" + dep));
-        }
-        t["dependencies"] = deps;
-
-        JObject fw;
-        fw["guid"] = guid + "::BUILDPHASE_0";
-        fw["type"] = std::string("com.apple.buildphase.frameworks");
-        fw["buildFiles"] = frameworkFiles;
-
-        if (prod.isDynamic()) {
-            /* Real framework product target. */
-            t["type"] = std::string("standard");
-            t["productTypeIdentifier"] = std::string("com.apple.product-type.framework");
-            t["productReference"] = packageProductReference(guid, prod.name + ".framework");
-            t["buildRules"] = JArray{};
-
-            JObject settings;
-            settings["PRODUCT_NAME"] = prod.name;
-            settings["TARGET_NAME"] = prod.name;
-            settings["PRODUCT_MODULE_NAME"] = prod.name;
-            settings["GENERATE_INFOPLIST_FILE"] = std::string("YES");
-            settings["SDK_VARIANT"] = std::string("auto");
-            settings["SDKROOT"] = std::string("auto");
-            t["buildConfigurations"] = packageBuildConfigurations(guid, settings);
-
-            JObject srcs;
-            srcs["guid"] = guid + "::BUILDPHASE_1";
-            srcs["type"] = std::string("com.apple.buildphase.sources");
-            srcs["buildFiles"] = JArray{};
-            t["buildPhases"] = JArray{fw, srcs};
-        } else {
-            t["type"] = std::string("packageProduct");
-
-            JObject settings;
-            settings["SDK_VARIANT"] = std::string("auto");
-            settings["SDKROOT"] = std::string("auto");
-            settings["USES_SWIFTPM_UNSAFE_FLAGS"] = std::string("NO");
-            t["buildConfigurations"] = packageBuildConfigurations(guid, settings);
-
-            t["frameworksBuildPhase"] = fw;
-        }
-
-        addTarget(t);
-    }
-
-    /* PACKAGE-TARGET (object-file) + dynamic variant + PACKAGE-RESOURCE. */
-    for (auto const &mn : moduleNames) {
-        auto const *ti = g.findTarget(mn);
-        bool isDynamicModule = dynamicModules.count(mn) != 0;
-        std::string guid = "PACKAGE-TARGET:" + mn;
-        std::string dynGUID = packageDynamicTargetGUID(mn);
-        std::string resGUID = "PACKAGE-RESOURCE:" + mn;
-        std::string resBundleName = g.name + "_" + mn;
-
-        /* Static object-file target. */
-        {
-            JObject t;
-            t["guid"] = guid;
-            t["name"] = mn;
-            t["type"] = std::string("standard");
-            t["approvedByUser"] = std::string("true");
-            t["customTasks"] = JArray{};
-            t["buildRules"] = JArray{};
-            t["productTypeIdentifier"] = std::string("com.apple.product-type.objfile");
-            t["productReference"] = packageProductReference(guid, mn + ".o");
-            if (!isDynamicModule) t["dynamicTargetVariantGuid"] = dynGUID;
-
-            JObject settings;
-            settings["PRODUCT_NAME"] = std::string("$(TARGET_NAME)");
-            settings["TARGET_NAME"] = mn;
-            settings["PRODUCT_MODULE_NAME"] = mn;
-            settings["EXECUTABLE_NAME"] = mn + ".o";
-            settings["MACH_O_TYPE"] = std::string("mh_object");
-            settings["CLANG_ENABLE_MODULES"] = std::string("YES");
-            settings["PACKAGE_RESOURCE_TARGET_KIND"] = std::string("regular");
-            settings["SDK_VARIANT"] = std::string("auto");
-            settings["SDKROOT"] = std::string("auto");
-            settings["SWIFT_VERSION"] = std::string("5");
-            t["buildConfigurations"] = packageBuildConfigurations(guid, settings);
-
-            JArray deps;
-            if (ti != nullptr && ti->hasResources) deps.push_back(packageDependency(resGUID));
-            for (auto const &dep : directModuleDeps(ti)) {
-                deps.push_back(packageDependency("PACKAGE-TARGET:" + dep));
-            }
-            t["dependencies"] = deps;
-
-            JObject sources;
-            sources["guid"] = guid + "::BUILDPHASE_0";
-            sources["type"] = std::string("com.apple.buildphase.sources");
-            sources["buildFiles"] = JArray{};
-            t["buildPhases"] = JArray{sources};
-
-            addTarget(t);
-        }
-
-        /* Dynamic (framework) variant — not emitted for modules that are
-         * themselves a dynamic library product. */
-        if (!isDynamicModule) {
-            JObject t;
-            t["guid"] = dynGUID;
-            t["name"] = mn;
-            t["type"] = std::string("standard");
-            t["approvedByUser"] = std::string("true");
-            t["customTasks"] = JArray{};
-            t["buildRules"] = JArray{};
-            t["productTypeIdentifier"] = std::string("com.apple.product-type.framework");
-            t["productReference"] = packageProductReference(dynGUID, mn + ".framework");
-
-            JObject settings;
-            settings["PRODUCT_NAME"] = mn;
-            settings["TARGET_NAME"] = mn;
-            settings["PRODUCT_MODULE_NAME"] = mn;
-            settings["CLANG_ENABLE_MODULES"] = std::string("YES");
-            settings["GENERATE_INFOPLIST_FILE"] = std::string("YES");
-            settings["PACKAGE_RESOURCE_TARGET_KIND"] = std::string("regular");
-            settings["SDK_VARIANT"] = std::string("auto");
-            settings["SDKROOT"] = std::string("auto");
-            settings["SWIFT_VERSION"] = std::string("5");
-            t["buildConfigurations"] = packageBuildConfigurations(dynGUID, settings);
-
-            /* The dynamic framework carries the module's sibling dependencies
-             * (but not its resource bundle). */
-            JArray dynDeps;
-            for (auto const &dep : directModuleDeps(ti)) {
-                dynDeps.push_back(packageDependency("PACKAGE-TARGET:" + dep));
-            }
-            t["dependencies"] = dynDeps;
-
-            JObject sources;
-            sources["guid"] = dynGUID + "::BUILDPHASE_0";
-            sources["type"] = std::string("com.apple.buildphase.sources");
-            sources["buildFiles"] = JArray{};
-            t["buildPhases"] = JArray{sources};
-
-            addTarget(t);
-        }
-
-        /* Resource bundle target (only when the module declares resources). */
-        if (ti != nullptr && ti->hasResources) {
-            JObject t;
-            t["guid"] = resGUID;
-            t["name"] = resBundleName;
-            t["type"] = std::string("standard");
-            t["approvedByUser"] = std::string("true");
-            t["customTasks"] = JArray{};
-            t["buildRules"] = JArray{};
-            t["productTypeIdentifier"] = std::string("com.apple.product-type.bundle");
-            t["productReference"] = packageProductReference(resGUID, resBundleName);
-
-            JObject settings;
-            settings["PRODUCT_NAME"] = std::string("$(TARGET_NAME)");
-            settings["TARGET_NAME"] = resBundleName;
-            settings["PRODUCT_MODULE_NAME"] = resBundleName;
-            settings["PACKAGE_RESOURCE_TARGET_KIND"] = std::string("resource");
-            settings["GENERATE_INFOPLIST_FILE"] = std::string("YES");
-            settings["SDK_VARIANT"] = std::string("auto");
-            settings["SDKROOT"] = std::string("auto");
-            t["buildConfigurations"] = packageBuildConfigurations(resGUID, settings);
-
-            t["dependencies"] = JArray{};
-
-            JObject resources;
-            resources["guid"] = resGUID + "::BUILDPHASE_0";
-            resources["type"] = std::string("com.apple.buildphase.resources");
-            resources["buildFiles"] = JArray{};
-            t["buildPhases"] = JArray{resources};
-
-            addTarget(t);
-        }
-    }
-
-    /* Package project. */
-    JObject p;
-    p["guid"] = projGUID;
-    p["path"] = g.dir + "/Package.swift";
-    p["projectDirectory"] = g.dir;
-    p["projectName"] = g.name;
-    p["projectIsPackage"] = std::string("true");
-    p["developmentRegion"] = std::string("en");
-    p["defaultConfigurationName"] = std::string("Release");
-    p["buildConfigurations"] = JArray{};
-
-    JObject group;
-    group["guid"] = projGUID + "::MAINGROUP";
-    group["sourceTree"] = std::string("<absolute>");
-    group["name"] = g.name;
-    group["path"] = g.dir;
-    group["type"] = std::string("group");
-    p["groupTree"] = group;
-
-    JArray targetSigs;
-    for (auto const &t : out.targets) targetSigs.push_back(t.first);
-    p["targets"] = targetSigs;
-
-    out.project = p;
-    return out;
 }
 
 } /* namespace */
@@ -1640,12 +1290,13 @@ Run(process::User const *user, process::Context const *processContext, Filesyste
     }
 
     /*
-     * Discover Swift packages referenced by any project and load their graphs
-     * via `swift package dump-package`. Each becomes a synthesized PACKAGE:
-     * project, mirroring what the host emits. Packages are keyed by their
-     * resolved directory and ordered by it for determinism.
+     * Discover Swift packages referenced by any project and obtain each one's
+     * PIF from SwiftPM (`swift package ... dump-pif`), adapted to the host's
+     * app-embedded GUID scheme. Packages are keyed by their resolved directory
+     * and ordered by it for determinism. Each entry is the package's list of
+     * spliced PIF objects (its project plus targets).
      */
-    std::vector<PackageGraph> packageGraphs;
+    std::vector<std::vector<SplicedPackageObject>> packagePIFs;
     {
         std::unordered_set<std::string> seenPackageDirs;
         std::vector<std::string> packageDirs;
@@ -1659,8 +1310,8 @@ Run(process::User const *user, process::Context const *processContext, Filesyste
         }
         std::sort(packageDirs.begin(), packageDirs.end());
         for (auto const &dir : packageDirs) {
-            if (auto g = loadPackageGraph(dir)) {
-                packageGraphs.push_back(*g);
+            if (auto objs = loadPackagePIF(dir)) {
+                packagePIFs.push_back(std::move(*objs));
             } else {
                 fprintf(stderr, "warning: unable to load Swift package at '%s' (swift toolchain required); its targets will be omitted from the PIF\n", dir.c_str());
             }
@@ -1681,10 +1332,14 @@ Run(process::User const *user, process::Context const *processContext, Filesyste
             projectSigsForJSON.push_back(sig);
             projectSigsForHash.push_back(sig);
         }
-        for (auto const &g : packageGraphs) {
-            std::string sig = packageSignature(packageProjectGUID(g));
-            projectSigsForJSON.push_back(sig);
-            projectSigsForHash.push_back(sig);
+        for (auto const &objs : packagePIFs) {
+            for (auto const &obj : objs) {
+                if (obj.isProject) {
+                    std::string sig = packageSignature(obj.guid);
+                    projectSigsForJSON.push_back(sig);
+                    projectSigsForHash.push_back(sig);
+                }
+            }
         }
         contents["projects"] = projectSigsForJSON;
 
@@ -1711,22 +1366,14 @@ Run(process::User const *user, process::Context const *processContext, Filesyste
         }
     }
 
-    /* Synthesized Swift package projects and their targets. */
-    for (auto const &g : packageGraphs) {
-        EmittedPackage ep = emitPackage(g);
-
-        JObject po;
-        po["type"] = "project";
-        po["signature"] = packageSignature(packageProjectGUID(g));
-        po["contents"] = ep.project;
-        pif.push_back(po);
-
-        for (auto const &t : ep.targets) {
-            JObject to;
-            to["type"] = "target";
-            to["signature"] = t.first;
-            to["contents"] = t.second;
-            pif.push_back(to);
+    /* Swift package projects and targets, spliced from SwiftPM's PIF. */
+    for (auto const &objs : packagePIFs) {
+        for (auto const &obj : objs) {
+            JObject o;
+            o["type"] = obj.isProject ? "project" : "target";
+            o["signature"] = obj.isProject ? packageSignature(obj.guid) : packageTargetSignature(obj.guid);
+            o["contents"] = obj.contents;
+            pif.push_back(o);
         }
     }
 
