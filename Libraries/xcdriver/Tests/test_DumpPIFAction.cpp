@@ -455,3 +455,247 @@ TEST(DumpPIFAction, SwiftPackageProductDependency)
     }
     EXPECT_EQ(1, pkgDeps) << "expected exactly one PACKAGE-PRODUCT:MyLib dependency guid";
 }
+
+/*
+ * A project with one target whose Release configuration sets a build setting
+ * using the ${X} reference syntax and an INFOPLIST_FILE pointing at an
+ * Info.plist that carries an explicit CFBundleIdentifier.
+ */
+static char const kSettingsAndInfoPlistPBXProj[] = R"PBX(// !$*UTF8*$!
+{
+    archiveVersion = 1;
+    classes = { };
+    objectVersion = 46;
+    objects = {
+
+        PROJECT0000000000000001 = {
+            isa = PBXProject;
+            buildConfigurationList = CFGLISTPROJECT000000001;
+            mainGroup = GROUPMAIN00000000000001;
+            targets = ( TARGETAPP00000000000001 );
+        };
+
+        GROUPMAIN00000000000001 = {
+            isa = PBXGroup;
+            children = ( FILEAPP0000000000000001 );
+            sourceTree = "<group>";
+        };
+
+        FILEAPP0000000000000001 = {
+            isa = PBXFileReference;
+            explicitFileType = wrapper.application;
+            path = App.app;
+            includeInIndex = 0;
+            sourceTree = BUILT_PRODUCTS_DIR;
+        };
+
+        PHASESRC000000000001 = {
+            isa = PBXSourcesBuildPhase;
+            buildActionMask = 2147483647;
+            files = ( );
+            runOnlyForDeploymentPostprocessing = 0;
+        };
+
+        TARGETAPP00000000000001 = {
+            isa = PBXNativeTarget;
+            buildConfigurationList = CFGLISTAPP0000000000001;
+            buildPhases = ( PHASESRC000000000001 );
+            buildRules = ( );
+            dependencies = ( );
+            name = App;
+            productName = App;
+            productReference = FILEAPP0000000000000001;
+            productType = "com.apple.product-type.application";
+        };
+
+        CFGBUILDPROJECT0000001 = { isa = XCBuildConfiguration; buildSettings = { }; name = Release; };
+        CFGBUILDAPP000000001 = {
+            isa = XCBuildConfiguration;
+            buildSettings = {
+                DEVELOPMENT_TEAM = "${TEAM_ID}";
+                INFOPLIST_FILE = "Info.plist";
+            };
+            name = Release;
+        };
+
+        CFGLISTPROJECT000000001 = {
+            isa = XCConfigurationList;
+            buildConfigurations = ( CFGBUILDPROJECT0000001 );
+            defaultConfigurationIsVisible = 0;
+            defaultConfigurationName = Release;
+        };
+
+        CFGLISTAPP0000000000001 = {
+            isa = XCConfigurationList;
+            buildConfigurations = ( CFGBUILDAPP000000001 );
+            defaultConfigurationIsVisible = 0;
+            defaultConfigurationName = Release;
+        };
+
+    };
+    rootObject = PROJECT0000000000000001;
+}
+)PBX";
+
+static char const kInfoPlist[] =
+    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+    "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+    "<plist version=\"1.0\">\n"
+    "<dict>\n"
+    "  <key>CFBundleIdentifier</key>\n"
+    "  <string>com.example.explicit</string>\n"
+    "</dict>\n"
+    "</plist>\n";
+
+/*
+ * Regression test for build-setting value fidelity and Info.plist bundle id
+ * resolution. The ${TEAM_ID} reference must survive verbatim (not be normalized
+ * to $(TEAM_ID)), and bundleIdentifierFromInfoPlist must be read from the
+ * target's Info.plist CFBundleIdentifier.
+ */
+TEST(DumpPIFAction, SettingSyntaxAndInfoPlistBundleIdentifier)
+{
+    MemoryFilesystem filesystem = MemoryFilesystem({
+        MemoryFilesystem::Entry::Directory("Workspace", {
+            MemoryFilesystem::Entry::File("Info.plist", Contents(kInfoPlist)),
+            MemoryFilesystem::Entry::Directory("Project.xcodeproj", {
+                MemoryFilesystem::Entry::File("project.pbxproj", Contents(kSettingsAndInfoPlistPBXProj)),
+            }),
+        }),
+        MemoryFilesystem::Entry::Directory("out", { }),
+    });
+
+    Options options;
+    auto parsed = libutil::Options::Parse<Options>(&options, {
+        "-project", filesystem.path("Workspace/Project.xcodeproj"),
+        "-dumpPIF", filesystem.path("out/pif.json"),
+    });
+    ASSERT_TRUE(parsed.first) << parsed.second;
+
+    process::DefaultUser user;
+    process::MemoryContext processContext = process::MemoryContext(
+        "xcodebuild", filesystem.path(""), { },
+        std::unordered_map<std::string, std::string>());
+    ASSERT_EQ(0, DumpPIFAction::Run(&user, &processContext, &filesystem, options));
+
+    std::vector<uint8_t> bytes;
+    ASSERT_TRUE(filesystem.read(&bytes, filesystem.path("out/pif.json")));
+    std::string json(bytes.begin(), bytes.end());
+
+    /* ${TEAM_ID} is preserved verbatim, not normalized to $(TEAM_ID). */
+    EXPECT_NE(std::string::npos, json.find("\"DEVELOPMENT_TEAM\" : \"${TEAM_ID}\""))
+        << "DEVELOPMENT_TEAM reference syntax was not preserved";
+    EXPECT_EQ(std::string::npos, json.find("$(TEAM_ID)"))
+        << "reference syntax was normalized to $(...)";
+
+    /* The Info.plist's CFBundleIdentifier is read verbatim into the
+     * provisioning data. */
+    std::vector<std::string> ids = ExtractValues(json, "bundleIdentifierFromInfoPlist");
+    ASSERT_FALSE(ids.empty());
+    for (auto const &id : ids) {
+        EXPECT_EQ("com.example.explicit", id);
+    }
+}
+
+/*
+ * A target with neither an INFOPLIST_FILE nor GENERATE_INFOPLIST_FILE has no
+ * bundle at all (like a static library), so its bundle identifier is empty —
+ * matching the host. kPackageProductPBXProj's App target sets neither.
+ */
+TEST(DumpPIFAction, BundleIdentifierEmptyWithoutInfoPlist)
+{
+    std::string json = DumpPIF(kPackageProductPBXProj);
+    std::vector<std::string> ids = ExtractValues(json, "bundleIdentifierFromInfoPlist");
+    ASSERT_FALSE(ids.empty());
+    for (auto const &id : ids) {
+        EXPECT_EQ("", id);
+    }
+}
+
+/*
+ * A target that enables GENERATE_INFOPLIST_FILE but has no INFOPLIST_FILE on
+ * disk. Xcode synthesizes an Info.plist whose bundle identifier defaults to
+ * $(PRODUCT_BUNDLE_IDENTIFIER), which is what the host records — so we do too.
+ */
+static char const kGeneratedInfoPlistPBXProj[] = R"PBX(// !$*UTF8*$!
+{
+    archiveVersion = 1;
+    classes = { };
+    objectVersion = 46;
+    objects = {
+
+        PROJECT0000000000000001 = {
+            isa = PBXProject;
+            buildConfigurationList = CFGLISTPROJECT000000001;
+            mainGroup = GROUPMAIN00000000000001;
+            targets = ( TARGETAPP00000000000001 );
+        };
+
+        GROUPMAIN00000000000001 = {
+            isa = PBXGroup;
+            children = ( FILEAPP0000000000000001 );
+            sourceTree = "<group>";
+        };
+
+        FILEAPP0000000000000001 = {
+            isa = PBXFileReference;
+            explicitFileType = wrapper.application;
+            path = App.app;
+            includeInIndex = 0;
+            sourceTree = BUILT_PRODUCTS_DIR;
+        };
+
+        PHASESRC000000000001 = {
+            isa = PBXSourcesBuildPhase;
+            buildActionMask = 2147483647;
+            files = ( );
+            runOnlyForDeploymentPostprocessing = 0;
+        };
+
+        TARGETAPP00000000000001 = {
+            isa = PBXNativeTarget;
+            buildConfigurationList = CFGLISTAPP0000000000001;
+            buildPhases = ( PHASESRC000000000001 );
+            buildRules = ( );
+            dependencies = ( );
+            name = App;
+            productName = App;
+            productReference = FILEAPP0000000000000001;
+            productType = "com.apple.product-type.application";
+        };
+
+        CFGBUILDPROJECT0000001 = { isa = XCBuildConfiguration; buildSettings = { }; name = Release; };
+        CFGBUILDAPP000000001 = {
+            isa = XCBuildConfiguration;
+            buildSettings = { GENERATE_INFOPLIST_FILE = YES; };
+            name = Release;
+        };
+
+        CFGLISTPROJECT000000001 = {
+            isa = XCConfigurationList;
+            buildConfigurations = ( CFGBUILDPROJECT0000001 );
+            defaultConfigurationIsVisible = 0;
+            defaultConfigurationName = Release;
+        };
+
+        CFGLISTAPP0000000000001 = {
+            isa = XCConfigurationList;
+            buildConfigurations = ( CFGBUILDAPP000000001 );
+            defaultConfigurationIsVisible = 0;
+            defaultConfigurationName = Release;
+        };
+
+    };
+    rootObject = PROJECT0000000000000001;
+}
+)PBX";
+
+TEST(DumpPIFAction, BundleIdentifierGeneratedInfoPlist)
+{
+    std::string json = DumpPIF(kGeneratedInfoPlistPBXProj);
+    std::vector<std::string> ids = ExtractValues(json, "bundleIdentifierFromInfoPlist");
+    ASSERT_FALSE(ids.empty());
+    for (auto const &id : ids) {
+        EXPECT_EQ("$(PRODUCT_BUNDLE_IDENTIFIER)", id);
+    }
+}

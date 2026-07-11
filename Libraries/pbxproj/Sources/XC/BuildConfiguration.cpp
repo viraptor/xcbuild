@@ -8,6 +8,7 @@
 
 #include <pbxproj/XC/BuildConfiguration.h>
 #include <pbxproj/Context.h>
+#include <plist/String.h>
 
 using pbxproj::XC::BuildConfiguration;
 using pbxproj::Context;
@@ -56,6 +57,16 @@ parse(Context &context, plist::Dictionary const *dict, std::unordered_set<std::s
             auto BSv = BS->value(BSk);
             pbxsetting::Setting setting = pbxsetting::Setting::Create(BSk, pbxsetting::Value::FromObject(BSv));
             settings.push_back(setting);
+
+            /* Keep the value exactly as written for string settings so callers
+             * that reproduce the project (e.g. PIF emission) don't normalize
+             * ${X}/$X reference syntax to $(X). Non-string settings keep their
+             * existing formatted representation. */
+            if (auto BSs = plist::CastTo<plist::String>(BSv)) {
+                _buildSettingsRaw.emplace_back(BSk, BSs->value());
+            } else {
+                _buildSettingsRaw.emplace_back(BSk, pbxsetting::Value::FromObject(BSv).raw());
+            }
         }
         _buildSettings = pbxsetting::Level(settings);
     }

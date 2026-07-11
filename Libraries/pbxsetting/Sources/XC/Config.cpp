@@ -98,32 +98,50 @@ ParseInclude(std::string const &value)
 }
 
 static ext::optional<Config::Entry>
-ParseDirective(Filesystem const *filesystem, Environment const &environment, std::string const &directory, std::string const &line)
+ParseDirective(Filesystem const *filesystem, Environment const &environment, std::string const &directory, std::string const &line, bool *skipped)
 {
-    std::string include = "include";
-    if (line.compare(1, 1 + include.size(), include)) {
-        /* Handle include directive. */
-        std::string value = line.substr(1 + include.size());
-        if (ext::optional<Value> parsed = ParseInclude(value)) {
-            /* Determine the path on disk. */
-            std::string path = environment.expand(*parsed);
-            path = FSUtil::ResolveRelativePath(path, directory);
+    *skipped = false;
 
-            /* Load included config. */
-            if (ext::optional<Config> config = Config::Load(filesystem, environment, path)) {
-                return Config::Entry(*parsed, std::make_shared<Config>(*config));
-            } else {
-                /* Failed to load included config. */
-                return ext::nullopt;
-            }
-        } else {
-            /* Failed to parse include. */
-            return ext::nullopt;
-        }
-    } else {
+    /* The line starts with '#'. Only the `include` directive is supported; it
+     * may be followed by `?` to mark the include as optional, in which case a
+     * missing file is silently skipped rather than treated as an error. */
+    std::string const include = "include";
+    std::string rest = line.substr(1);
+    if (rest.compare(0, include.size(), include) != 0) {
         /* Unknown preprocessor directive. */
         return ext::nullopt;
     }
+    rest = rest.substr(include.size());
+
+    bool optional = false;
+    if (!rest.empty() && rest.front() == '?') {
+        optional = true;
+        rest = rest.substr(1);
+    }
+
+    ext::optional<Value> parsed = ParseInclude(rest);
+    if (!parsed) {
+        /* Failed to parse include. */
+        return ext::nullopt;
+    }
+
+    /* Determine the path on disk. */
+    std::string path = environment.expand(*parsed);
+    path = FSUtil::ResolveRelativePath(path, directory);
+
+    /* An optional include that isn't present is skipped without error. */
+    if (optional && !filesystem->isReadable(path)) {
+        *skipped = true;
+        return ext::nullopt;
+    }
+
+    /* Load included config. */
+    if (ext::optional<Config> config = Config::Load(filesystem, environment, path)) {
+        return Config::Entry(*parsed, std::make_shared<Config>(*config));
+    }
+
+    /* Failed to load included config. */
+    return ext::nullopt;
 }
 
 ext::optional<Config> Config::
@@ -172,12 +190,14 @@ Load(Filesystem const *filesystem, Environment const &environment, std::string c
             if (!line.empty()) {
                 if (line.front() == '#') {
                     /* Parse directive. */
-                    if (ext::optional<Entry> entry = ParseDirective(filesystem, environment, directory, line)) {
+                    bool skipped = false;
+                    if (ext::optional<Entry> entry = ParseDirective(filesystem, environment, directory, line, &skipped)) {
                         entries.push_back(*entry);
-                    } else {
+                    } else if (!skipped) {
                         /* Failed to parse directive. */
                         return ext::nullopt;
                     }
+                    /* A skipped optional include contributes no entry. */
                 } else {
                     /* Trim whitespace. */
                     libutil::trim(line);

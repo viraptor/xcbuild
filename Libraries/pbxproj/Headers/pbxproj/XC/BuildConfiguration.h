@@ -23,6 +23,7 @@ private:
     std::string                     _name;
     PBX::FileReference::shared_ptr  _baseConfigurationReference;
     pbxsetting::Level               _buildSettings;
+    std::vector<std::pair<std::string, std::string>> _buildSettingsRaw;
 
 public:
     BuildConfiguration();
@@ -35,6 +36,16 @@ public:
 public:
     inline pbxsetting::Level const &buildSettings() const
     { return _buildSettings; }
+
+    /*
+     * The build settings exactly as written in the project, in file order:
+     * original key (including any `[condition]` suffix) paired with the verbatim
+     * value string. Unlike buildSettings(), this does not normalize setting
+     * reference syntax (${X}/$X stay as written rather than becoming $(X)), so
+     * it reproduces the host's PIF output byte-for-byte.
+     */
+    inline std::vector<std::pair<std::string, std::string>> const &buildSettingsRaw() const
+    { return _buildSettingsRaw; }
 
 public:
     inline std::string const &name() const

@@ -94,3 +94,50 @@ TEST(Config, Include)
     EXPECT_EQ(config->contents().at(0).config()->contents().at(0).setting()->value(), Value::String("VALUE"));
 }
 
+TEST(Config, MissingRequiredIncludeFails)
+{
+    Environment environment = Environment();
+    MemoryFilesystem filesystem = MemoryFilesystem({
+        MemoryFilesystem::Entry::File("include.xcconfig", Contents("#include \"missing.xcconfig\"")),
+    });
+
+    /* A required include of a missing file is an error. */
+    auto config = Config::Load(&filesystem, environment, filesystem.path("include.xcconfig"));
+    EXPECT_EQ(config, ext::nullopt);
+}
+
+TEST(Config, MissingOptionalIncludeSkipped)
+{
+    Environment environment = Environment();
+    MemoryFilesystem filesystem = MemoryFilesystem({
+        MemoryFilesystem::Entry::File("include.xcconfig", Contents(
+            "#include? \"missing.xcconfig\"\n"
+            "NAME = VALUE\n")),
+    });
+
+    /* An optional include (`#include?`) of a missing file is skipped, and the
+     * rest of the config still loads. */
+    auto config = Config::Load(&filesystem, environment, filesystem.path("include.xcconfig"));
+    ASSERT_NE(config, ext::nullopt);
+    ASSERT_EQ(config->contents().size(), 1);
+    ASSERT_EQ(config->contents().at(0).type(), Config::Entry::Type::Setting);
+    EXPECT_EQ(config->contents().at(0).setting()->name(), "NAME");
+    EXPECT_EQ(config->contents().at(0).setting()->value(), Value::String("VALUE"));
+}
+
+TEST(Config, PresentOptionalIncludeLoaded)
+{
+    Environment environment = Environment();
+    MemoryFilesystem filesystem = MemoryFilesystem({
+        MemoryFilesystem::Entry::File("common.xcconfig", Contents("NAME = VALUE")),
+        MemoryFilesystem::Entry::File("include.xcconfig", Contents("#include? \"common.xcconfig\"")),
+    });
+
+    /* An optional include of a file that exists is loaded like a required one. */
+    auto config = Config::Load(&filesystem, environment, filesystem.path("include.xcconfig"));
+    ASSERT_NE(config, ext::nullopt);
+    ASSERT_EQ(config->contents().size(), 1);
+    ASSERT_EQ(config->contents().at(0).type(), Config::Entry::Type::Include);
+    EXPECT_EQ(config->contents().at(0).config()->path(), filesystem.path("common.xcconfig"));
+}
+

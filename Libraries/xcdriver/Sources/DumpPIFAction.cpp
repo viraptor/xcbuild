@@ -32,7 +32,12 @@
 #include <xcworkspace/XC/Workspace.h>
 #include <pbxsetting/Environment.h>
 #include <pbxsetting/Setting.h>
+#include <pbxsetting/Type.h>
 #include <pbxsetting/Value.h>
+#include <pbxsetting/XC/Config.h>
+#include <plist/Format/Any.h>
+#include <plist/Dictionary.h>
+#include <plist/String.h>
 #include <libutil/Filesystem.h>
 #include <libutil/FSUtil.h>
 #include <libutil/md5.h>
@@ -379,20 +384,13 @@ JObject emitBuildConfiguration(PIFContext const &ctx, pbxproj::PBX::Project cons
     obj["guid"] = objectGUID(ctx, project, config);
     obj["name"] = config.name();
 
+    /* Emit build settings verbatim — original key (with any `[condition]`
+     * suffix) and value exactly as written. Going through the parsed
+     * pbxsetting::Value would normalize ${X}/$X reference syntax to $(X),
+     * diverging from the host's byte-for-byte output. */
     JObject settings;
-    for (auto const &setting : config.buildSettings().settings()) {
-        std::string key = setting.name();
-        if (!setting.condition().values().empty()) {
-            key += "[";
-            bool first = true;
-            for (auto const &cv : setting.condition().values()) {
-                if (!first) key += ",";
-                first = false;
-                key += cv.first + "=" + cv.second;
-            }
-            key += "]";
-        }
-        settings[key] = setting.value().raw();
+    for (auto const &kv : config.buildSettingsRaw()) {
+        settings[kv.first] = kv.second;
     }
     obj["buildSettings"] = settings;
 
@@ -758,7 +756,91 @@ JObject emitProject(PIFContext const &ctx, pbxproj::PBX::Project const &project)
     return p;
 }
 
-JObject emitTarget(PIFContext const &ctx, pbxproj::PBX::Project const &project, pbxproj::PBX::Target const &target) {
+/*
+ * The bundle identifier the host records in each target's provisioningSourceData.
+ * It is read verbatim (not resolved) from the CFBundleIdentifier of the target's
+ * Info.plist — INFOPLIST_FILE resolved through the project/target build settings,
+ * including any xcconfig base configurations. When there is no readable Info.plist
+ * (e.g. GENERATE_INFOPLIST_FILE targets), the host falls back to the standard
+ * `$(PRODUCT_BUNDLE_IDENTIFIER)` expression, which is what a generated Info.plist
+ * would contain.
+ */
+std::string infoPlistBundleIdentifier(Filesystem *filesystem,
+                                      pbxproj::PBX::Project const &project,
+                                      pbxproj::PBX::Target const &target,
+                                      pbxproj::XC::BuildConfiguration::shared_ptr const &config) {
+    static std::string const kDefault = "$(PRODUCT_BUNDLE_IDENTIFIER)";
+
+    auto configNamed = [](pbxproj::XC::ConfigurationList::shared_ptr const &list, std::string const &name)
+        -> pbxproj::XC::BuildConfiguration::shared_ptr {
+        if (list == nullptr) return nullptr;
+        for (auto const &c : list->buildConfigurations()) {
+            if (c->name() == name) return c;
+        }
+        return nullptr;
+    };
+
+    /* Layer the setting sources the way a build does, lowest priority first:
+     * a source-root base (so group-relative xcconfig paths resolve), project
+     * settings, project config (xcconfig then inline), target settings, target
+     * config (xcconfig then inline). SDK/spec levels are irrelevant to a
+     * user-set INFOPLIST_FILE, so we omit them. We load the xcconfig base
+     * configurations here rather than reusing the workspace's, because dumpPIF
+     * loads the workspace with an empty environment in which their group paths
+     * can't resolve. */
+    pbxsetting::Environment env;
+    env.insertFront(pbxsetting::Level({
+        pbxsetting::Setting::Create("SOURCE_ROOT", project.basePath()),
+        pbxsetting::Setting::Create("SRCROOT", project.basePath()),
+        pbxsetting::Setting::Create("PROJECT_DIR", project.basePath()),
+    }), false);
+    env.insertFront(project.settings(), false);
+
+    auto applyConfig = [&](pbxproj::XC::BuildConfiguration::shared_ptr const &c) {
+        if (c == nullptr) return;
+        if (auto ref = c->baseConfigurationReference()) {
+            std::string path = env.expand(ref->resolve());
+            if (auto file = pbxsetting::XC::Config::Load(filesystem, env, path)) {
+                env.insertFront(file->level(), false);
+            }
+        }
+        env.insertFront(c->buildSettings(), false);
+    };
+    applyConfig(configNamed(project.buildConfigurationList(), config->name()));
+    env.insertFront(target.settings(), false);
+    applyConfig(config);
+
+    std::string infoPlist = env.resolve("INFOPLIST_FILE");
+    if (infoPlist.empty()) {
+        /* No Info.plist file. Xcode still synthesizes one when
+         * GENERATE_INFOPLIST_FILE is enabled, defaulting the identifier to
+         * $(PRODUCT_BUNDLE_IDENTIFIER); otherwise the target has no bundle (e.g.
+         * a static library) and the host records an empty identifier. */
+        if (pbxsetting::Type::ParseBoolean(env.resolve("GENERATE_INFOPLIST_FILE"))) {
+            return kDefault;
+        }
+        return std::string();
+    }
+
+    /* An Info.plist is expected: read its CFBundleIdentifier verbatim, falling
+     * back to the standard $(PRODUCT_BUNDLE_IDENTIFIER) if the file or key is
+     * missing (which is also Xcode's default for a bundle target). */
+    std::string path = libutil::FSUtil::ResolveRelativePath(infoPlist, project.basePath());
+    std::vector<uint8_t> bytes;
+    if (filesystem->isReadable(path) && filesystem->read(&bytes, path)) {
+        auto result = plist::Format::Any::Deserialize(bytes);
+        if (result.first != nullptr) {
+            if (auto dict = plist::CastTo<plist::Dictionary>(result.first.get())) {
+                if (auto id = dict->value<plist::String>("CFBundleIdentifier")) {
+                    return id->value();
+                }
+            }
+        }
+    }
+    return kDefault;
+}
+
+JObject emitTarget(PIFContext const &ctx, Filesystem *filesystem, pbxproj::PBX::Project const &project, pbxproj::PBX::Target const &target) {
     JObject t;
     /* Target objects use the same `<projectGuid><MD5(blueprintId)>` GUID
      * scheme as any other object in the project — both for the target's own
@@ -858,7 +940,7 @@ JObject emitTarget(PIFContext const &ctx, pbxproj::PBX::Project const &project, 
     if (target.buildConfigurationList()) {
         for (auto const &cfg : target.buildConfigurationList()->buildConfigurations()) {
             JObject p;
-            p["bundleIdentifierFromInfoPlist"] = std::string("");
+            p["bundleIdentifierFromInfoPlist"] = infoPlistBundleIdentifier(filesystem, project, target, cfg);
             p["configurationName"] = cfg->name();
             p["provisioningStyle"] = (long long)1;
             prov.push_back(p);
@@ -1010,7 +1092,7 @@ Run(process::User const *user, process::Context const *processContext, Filesyste
             JObject to;
             to["type"] = "target";
             to["signature"] = targetSignature(ctx, *project, *target);
-            to["contents"] = emitTarget(ctx, *project, *target);
+            to["contents"] = emitTarget(ctx, filesystem, *project, *target);
             pif.push_back(to);
         }
     }
