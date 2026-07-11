@@ -281,6 +281,8 @@ void stripPackageFileNodeNames(JValue &node) {
 struct SplicedPackageObject {
     bool isProject;
     std::string guid;
+    std::string signature; /* SwiftPM's own signature, kept so a project's
+                            * `targets` list keeps matching its target objects. */
     JValue contents;
 };
 
@@ -459,6 +461,13 @@ ext::optional<std::vector<SplicedPackageObject>> loadPackagePIF(std::string cons
         bool isProject = (t == "project");
         if (!isProject && t != "target") continue;
 
+        /* Keep SwiftPM's signature: a project's `targets` array lists its
+         * targets by signature, so the emitted target objects must carry those
+         * same signatures or swift-build won't associate them with the project
+         * (and the package products won't be found). */
+        std::string signature;
+        if (auto sigS = o->value<plist::String>("signature")) signature = sigS->value();
+
         JValue jc = plistToJValue(contents);
         if (isProject) {
             auto gt = jc.o.find("groupTree");
@@ -466,7 +475,7 @@ ext::optional<std::vector<SplicedPackageObject>> loadPackagePIF(std::string cons
         } else if (guid.rfind("PACKAGE-PRODUCT:", 0) == 0) {
             jc = toEmbeddedPackageProduct(std::move(jc));
         }
-        result.push_back({isProject, guid, std::move(jc)});
+        result.push_back({isProject, guid, signature, std::move(jc)});
     }
     return result;
 }
@@ -1418,7 +1427,7 @@ Run(process::User const *user, process::Context const *processContext, Filesyste
         for (auto const &objs : packagePIFs) {
             for (auto const &obj : objs) {
                 if (obj.isProject) {
-                    std::string sig = packageSignature(obj.guid);
+                    std::string sig = obj.signature.empty() ? packageSignature(obj.guid) : obj.signature;
                     projectSigsForJSON.push_back(sig);
                     projectSigsForHash.push_back(sig);
                 }
@@ -1449,12 +1458,18 @@ Run(process::User const *user, process::Context const *processContext, Filesyste
         }
     }
 
-    /* Swift package projects and targets, spliced from SwiftPM's PIF. */
+    /* Swift package projects and targets, spliced from SwiftPM's PIF. Keep
+     * SwiftPM's signatures so each project's `targets` list keeps matching its
+     * target objects. */
     for (auto const &objs : packagePIFs) {
         for (auto const &obj : objs) {
             JObject o;
             o["type"] = obj.isProject ? "project" : "target";
-            o["signature"] = obj.isProject ? packageSignature(obj.guid) : packageTargetSignature(obj.guid);
+            if (!obj.signature.empty()) {
+                o["signature"] = obj.signature;
+            } else {
+                o["signature"] = obj.isProject ? packageSignature(obj.guid) : packageTargetSignature(obj.guid);
+            }
             o["contents"] = obj.contents;
             pif.push_back(o);
         }
