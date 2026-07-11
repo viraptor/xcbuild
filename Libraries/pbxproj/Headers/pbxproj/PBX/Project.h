@@ -12,6 +12,7 @@
 #include <pbxproj/PBX/Object.h>
 #include <pbxproj/PBX/Group.h>
 #include <pbxproj/PBX/Target.h>
+#include <pbxproj/PBX/SwiftPackageReference.h>
 #include <pbxproj/XC/ConfigurationList.h>
 
 namespace libutil { class Filesystem; }
@@ -61,6 +62,7 @@ private:
     std::string                        _projectDirPath;
     std::string                        _projectRoot;
     std::vector<ProjectReference>      _projectReferences;
+    SwiftPackageReference::vector       _packageReferences;
     Target::vector                     _targets;
     FileReference::vector              _fileReferences;
     std::string                        _classPrefix;
@@ -108,6 +110,10 @@ public:
 public:
     inline std::vector<ProjectReference> const &projectReferences() const
     { return _projectReferences; }
+
+public:
+    inline SwiftPackageReference::vector const &packageReferences() const
+    { return _packageReferences; }
 
 public:
     inline Target::vector const &targets() const

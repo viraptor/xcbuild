@@ -10,6 +10,7 @@
 #include <pbxproj/PBX/AggregateTarget.h>
 #include <pbxproj/PBX/LegacyTarget.h>
 #include <pbxproj/PBX/NativeTarget.h>
+#include <pbxproj/PBX/SwiftPackageReference.h>
 #include <pbxproj/Context.h>
 #include <plist/Array.h>
 #include <plist/Boolean.h>
@@ -82,6 +83,7 @@ parse(Context &context, plist::Dictionary const *dict, std::unordered_set<std::s
     auto PDP  = unpack.cast <plist::String> ("projectDirPath");
     auto PR   = unpack.cast <plist::String> ("projectRoot");
     auto PRs  = unpack.cast <plist::Array> ("projectReferences");
+    auto PkRs = unpack.cast <plist::Array> ("packageReferences");
     auto Ts   = unpack.cast <plist::Array> ("targets");
 
     if (!unpack.complete(check)) {
@@ -150,6 +152,22 @@ parse(Context &context, plist::Dictionary const *dict, std::unordered_set<std::s
                     return false;
                 }
                 _projectReferences.push_back(projectReference);
+            }
+        }
+    }
+
+    if (PkRs != nullptr) {
+        for (size_t n = 0; n < PkRs->count(); n++) {
+            std::string PkRID;
+            /* Only local package references carry a resolvable directory;
+             * remote references are skipped until package checkouts are
+             * modeled. */
+            if (auto PkRd = context.get <SwiftPackageReference> (PkRs->value(n), &PkRID)) {
+                auto PkR = context.parseObject(context.swiftPackageReferences, PkRID, PkRd);
+                if (!PkR) {
+                    return false;
+                }
+                _packageReferences.push_back(PkR);
             }
         }
     }

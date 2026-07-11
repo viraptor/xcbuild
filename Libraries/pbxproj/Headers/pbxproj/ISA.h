@@ -33,6 +33,8 @@ extern char const * const PBXTargetDependency;
 extern char const * const PBXVariantGroup;
 extern char const * const XCBuildConfiguration;
 extern char const * const XCConfigurationList;
+extern char const * const XCLocalSwiftPackageReference;
+extern char const * const XCRemoteSwiftPackageReference;
 extern char const * const XCSwiftPackageProductDependency;
 extern char const * const XCVersionGroup;
 
