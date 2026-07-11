@@ -244,7 +244,10 @@ struct PackageTargetInfo {
 struct PackageProductInfo {
     std::string name;
     bool isLibrary = false;
+    std::string libraryKind;   /* "static", "dynamic", "automatic", or empty */
     std::vector<std::string> targets;
+
+    bool isDynamic() const { return libraryKind == "dynamic"; }
 };
 
 struct PackageGraph {
@@ -302,7 +305,12 @@ ext::optional<PackageGraph> loadPackageGraph(std::string const &dir) {
             PackageProductInfo p;
             if (auto nm = pd->value<plist::String>("name")) p.name = nm->value();
             if (auto ty = pd->value<plist::Dictionary>("type")) {
-                if (ty->value<plist::Array>("library") != nullptr) p.isLibrary = true;
+                if (auto lib = ty->value<plist::Array>("library")) {
+                    p.isLibrary = true;
+                    if (lib->count() > 0) {
+                        if (auto k = lib->value<plist::String>(0)) p.libraryKind = k->value();
+                    }
+                }
             }
             if (auto ts = pd->value<plist::Array>("targets")) {
                 for (size_t k = 0; k < ts->count(); k++) {
@@ -1140,10 +1148,366 @@ std::string packageSignature(std::string const &guid) {
     return "PACKAGE@v12_hash=" + md5Hex(guid);
 }
 
-JObject emitPackageProject(PackageGraph const &g) {
+std::string packageTargetSignature(std::string const &guid) {
+    return "TARGET@v12_hash=" + md5Hex(guid);
+}
+
+/*
+ * The `-dynamic` variant GUID suffix SwiftPM appends: "-" + the module name's
+ * CoreFoundation string hash (NSString.hash) rendered as signed hex, + "-dynamic".
+ * The hash is negative for most names, so String(_,radix:16) prepends a '-',
+ * producing the doubled dash `name--HEX-dynamic`. Reimplements
+ * CFStringHashCharacters (ASCII/BMP names only). See the spm-dynamic-target-guid
+ * reference for the derivation.
+ */
+std::string cfStringHashHex(std::string const &s) {
+    uint64_t result = (uint64_t)s.size();
+    size_t L = s.size();
+    unsigned char const *u = (unsigned char const *)s.data();
+    size_t i = 0, end4 = L & ~size_t(3);
+    while (i < end4) {
+        result = result * 67503105ULL + (uint64_t)u[i] * 16974593ULL + (uint64_t)u[i + 1] * 66049ULL + (uint64_t)u[i + 2] * 257ULL + (uint64_t)u[i + 3];
+        i += 4;
+    }
+    while (i < L) { result = result * 257ULL + u[i]; ++i; }
+    result += result << (L & 31);
+
+    bool neg = (result >> 63) != 0;
+    uint64_t mag = neg ? (uint64_t)0 - result : result;
+    char buf[17];
+    int p = 16;
+    buf[16] = '\0';
+    if (mag == 0) buf[--p] = '0';
+    while (mag) { int d = (int)(mag & 0xF); buf[--p] = (char)(d < 10 ? '0' + d : 'A' + d - 10); mag >>= 4; }
+    std::string hex(buf + p);
+    return neg ? ("-" + hex) : hex;
+}
+
+std::string packageDynamicTargetGUID(std::string const &moduleName) {
+    return "PACKAGE-TARGET:" + moduleName + "-" + cfStringHashHex(moduleName) + "-dynamic";
+}
+
+/* A package target's two build configurations (Debug, Release) sharing one
+ * settings map, matching the host's per-target config shape. */
+JArray packageBuildConfigurations(std::string const &guid, JObject const &settings) {
+    JArray configs;
+    char const *names[2] = {"Debug", "Release"};
+    for (int i = 0; i < 2; i++) {
+        JObject c;
+        c["guid"] = guid + "::BUILDCONFIG_" + std::to_string(i);
+        c["name"] = std::string(names[i]);
+        c["buildSettings"] = settings;
+        JObject imparted;
+        imparted["buildSettings"] = JObject{};
+        c["impartedBuildProperties"] = imparted;
+        configs.push_back(c);
+    }
+    return configs;
+}
+
+JObject packageProductReference(std::string const &targetGUID, std::string const &name) {
+    JObject pr;
+    pr["guid"] = "PRODUCTREF-" + targetGUID;
+    pr["name"] = name;
+    /* Package target product references use "file" (not "product" as native
+     * PBX targets do), matching the host. */
+    pr["type"] = std::string("file");
+    return pr;
+}
+
+JObject packageDependency(std::string const &guid) {
+    JObject d;
+    d["guid"] = guid;
+    d["platformFilters"] = JArray{};
+    return d;
+}
+
+struct EmittedPackage {
+    JObject project;
+    std::vector<std::pair<std::string, JObject>> targets; /* signature, contents */
+};
+
+/*
+ * Emit a Swift package's PIF project and its targets. The host models each
+ * package product/target as several PIF targets:
+ *   PACKAGE-PRODUCT:<product>   the linkable product the app depends on
+ *   PACKAGE-TARGET:<module>     the module compiled to an object file (.o)
+ *   PACKAGE-TARGET:<module>--<hash>-dynamic   dynamic (framework) variant
+ *   PACKAGE-RESOURCE:<module>   resource bundle, when the module has resources
+ *
+ * PACKAGE-PRODUCT is reproduced faithfully (it's small and fully derivable, and
+ * it's what the consuming app links). The compiled-module targets carry correct
+ * identity/wiring (GUIDs, product references, dependencies, dynamic-variant
+ * link) and a derivable subset of build settings; the host synthesizes ~30 more
+ * settings and a full per-file group tree from the manifest, which are not yet
+ * reproduced (build phases are emitted empty). This is enough for every
+ * PACKAGE-* reference in the workspace to resolve.
+ */
+EmittedPackage emitPackage(PackageGraph const &g) {
+    EmittedPackage out;
+    std::string projGUID = packageProjectGUID(g);
+
+    auto addTarget = [&](JObject const &contents) {
+        std::string guid = contents.at("guid").s;
+        out.targets.emplace_back(packageTargetSignature(guid), contents);
+    };
+
+    /* Determine which modules to emit: those backing an emitted library product.
+     * Modules that back a `.dynamic` library product are the framework itself,
+     * so they get no separate dynamic variant. */
+    std::vector<std::string> moduleNames;
+    std::unordered_set<std::string> moduleSet;
+    std::unordered_set<std::string> dynamicModules;
+    for (auto const &prod : g.products) {
+        if (!prod.isLibrary) continue;
+        for (auto const &tn : prod.targets) {
+            if (g.findTarget(tn) != nullptr && moduleSet.insert(tn).second) {
+                moduleNames.push_back(tn);
+            }
+            if (prod.isDynamic()) dynamicModules.insert(tn);
+        }
+    }
+
+    /* Direct sibling-module dependencies of a target (those that are emitted
+     * modules, i.e. excluding binary/system targets). */
+    auto directModuleDeps = [&](PackageTargetInfo const *ti) {
+        std::vector<std::string> r;
+        if (ti != nullptr) {
+            for (auto const &d : ti->dependencies) {
+                if (moduleSet.count(d)) r.push_back(d);
+            }
+        }
+        return r;
+    };
+
+    /* Transitive sibling-module dependencies reachable from a starting set,
+     * excluding the starting set itself, in breadth-first order. */
+    auto transitiveModuleDeps = [&](std::vector<std::string> const &start) {
+        std::vector<std::string> order;
+        std::unordered_set<std::string> seen(start.begin(), start.end());
+        std::vector<std::string> work(start.begin(), start.end());
+        for (size_t w = 0; w < work.size(); w++) {
+            auto const *t = g.findTarget(work[w]);
+            if (t == nullptr) continue;
+            for (auto const &d : t->dependencies) {
+                if (moduleSet.count(d) && seen.insert(d).second) {
+                    order.push_back(d);
+                    work.push_back(d);
+                }
+            }
+        }
+        return order;
+    };
+
+    /* PACKAGE-PRODUCT targets. A static/automatic library product becomes a thin
+     * `packageProduct` linkable; a dynamic library product is a real framework
+     * target that links its module. */
+    for (auto const &prod : g.products) {
+        if (!prod.isLibrary) continue;
+        std::string guid = "PACKAGE-PRODUCT:" + prod.name;
+
+        JObject t;
+        t["guid"] = guid;
+        t["name"] = prod.name;
+        t["approvedByUser"] = std::string("true");
+        t["customTasks"] = JArray{};
+
+        JArray deps;
+        JArray frameworkFiles;
+        int idx = 0;
+        std::vector<std::string> ownTargets;
+        for (auto const &tn : prod.targets) {
+            auto const *ti = g.findTarget(tn);
+            if (ti == nullptr) continue;
+            ownTargets.push_back(tn);
+            deps.push_back(packageDependency("PACKAGE-TARGET:" + tn));
+            if (ti->hasResources) {
+                deps.push_back(packageDependency("PACKAGE-RESOURCE:" + tn));
+            }
+            JObject bf;
+            bf["guid"] = guid + "::BUILDPHASE_0::" + std::to_string(idx++);
+            bf["platformFilters"] = JArray{};
+            bf["targetReference"] = "PACKAGE-TARGET:" + tn;
+            frameworkFiles.push_back(bf);
+        }
+        /* The product also depends on the modules its own targets pull in
+         * transitively (linked through them, not in this frameworks phase). */
+        for (auto const &dep : transitiveModuleDeps(ownTargets)) {
+            deps.push_back(packageDependency("PACKAGE-TARGET:" + dep));
+        }
+        t["dependencies"] = deps;
+
+        JObject fw;
+        fw["guid"] = guid + "::BUILDPHASE_0";
+        fw["type"] = std::string("com.apple.buildphase.frameworks");
+        fw["buildFiles"] = frameworkFiles;
+
+        if (prod.isDynamic()) {
+            /* Real framework product target. */
+            t["type"] = std::string("standard");
+            t["productTypeIdentifier"] = std::string("com.apple.product-type.framework");
+            t["productReference"] = packageProductReference(guid, prod.name + ".framework");
+            t["buildRules"] = JArray{};
+
+            JObject settings;
+            settings["PRODUCT_NAME"] = prod.name;
+            settings["TARGET_NAME"] = prod.name;
+            settings["PRODUCT_MODULE_NAME"] = prod.name;
+            settings["GENERATE_INFOPLIST_FILE"] = std::string("YES");
+            settings["SDK_VARIANT"] = std::string("auto");
+            settings["SDKROOT"] = std::string("auto");
+            t["buildConfigurations"] = packageBuildConfigurations(guid, settings);
+
+            JObject srcs;
+            srcs["guid"] = guid + "::BUILDPHASE_1";
+            srcs["type"] = std::string("com.apple.buildphase.sources");
+            srcs["buildFiles"] = JArray{};
+            t["buildPhases"] = JArray{fw, srcs};
+        } else {
+            t["type"] = std::string("packageProduct");
+
+            JObject settings;
+            settings["SDK_VARIANT"] = std::string("auto");
+            settings["SDKROOT"] = std::string("auto");
+            settings["USES_SWIFTPM_UNSAFE_FLAGS"] = std::string("NO");
+            t["buildConfigurations"] = packageBuildConfigurations(guid, settings);
+
+            t["frameworksBuildPhase"] = fw;
+        }
+
+        addTarget(t);
+    }
+
+    /* PACKAGE-TARGET (object-file) + dynamic variant + PACKAGE-RESOURCE. */
+    for (auto const &mn : moduleNames) {
+        auto const *ti = g.findTarget(mn);
+        bool isDynamicModule = dynamicModules.count(mn) != 0;
+        std::string guid = "PACKAGE-TARGET:" + mn;
+        std::string dynGUID = packageDynamicTargetGUID(mn);
+        std::string resGUID = "PACKAGE-RESOURCE:" + mn;
+        std::string resBundleName = g.name + "_" + mn;
+
+        /* Static object-file target. */
+        {
+            JObject t;
+            t["guid"] = guid;
+            t["name"] = mn;
+            t["type"] = std::string("standard");
+            t["approvedByUser"] = std::string("true");
+            t["customTasks"] = JArray{};
+            t["buildRules"] = JArray{};
+            t["productTypeIdentifier"] = std::string("com.apple.product-type.objfile");
+            t["productReference"] = packageProductReference(guid, mn + ".o");
+            if (!isDynamicModule) t["dynamicTargetVariantGuid"] = dynGUID;
+
+            JObject settings;
+            settings["PRODUCT_NAME"] = std::string("$(TARGET_NAME)");
+            settings["TARGET_NAME"] = mn;
+            settings["PRODUCT_MODULE_NAME"] = mn;
+            settings["EXECUTABLE_NAME"] = mn + ".o";
+            settings["MACH_O_TYPE"] = std::string("mh_object");
+            settings["CLANG_ENABLE_MODULES"] = std::string("YES");
+            settings["PACKAGE_RESOURCE_TARGET_KIND"] = std::string("regular");
+            settings["SDK_VARIANT"] = std::string("auto");
+            settings["SDKROOT"] = std::string("auto");
+            settings["SWIFT_VERSION"] = std::string("5");
+            t["buildConfigurations"] = packageBuildConfigurations(guid, settings);
+
+            JArray deps;
+            if (ti != nullptr && ti->hasResources) deps.push_back(packageDependency(resGUID));
+            for (auto const &dep : directModuleDeps(ti)) {
+                deps.push_back(packageDependency("PACKAGE-TARGET:" + dep));
+            }
+            t["dependencies"] = deps;
+
+            JObject sources;
+            sources["guid"] = guid + "::BUILDPHASE_0";
+            sources["type"] = std::string("com.apple.buildphase.sources");
+            sources["buildFiles"] = JArray{};
+            t["buildPhases"] = JArray{sources};
+
+            addTarget(t);
+        }
+
+        /* Dynamic (framework) variant — not emitted for modules that are
+         * themselves a dynamic library product. */
+        if (!isDynamicModule) {
+            JObject t;
+            t["guid"] = dynGUID;
+            t["name"] = mn;
+            t["type"] = std::string("standard");
+            t["approvedByUser"] = std::string("true");
+            t["customTasks"] = JArray{};
+            t["buildRules"] = JArray{};
+            t["productTypeIdentifier"] = std::string("com.apple.product-type.framework");
+            t["productReference"] = packageProductReference(dynGUID, mn + ".framework");
+
+            JObject settings;
+            settings["PRODUCT_NAME"] = mn;
+            settings["TARGET_NAME"] = mn;
+            settings["PRODUCT_MODULE_NAME"] = mn;
+            settings["CLANG_ENABLE_MODULES"] = std::string("YES");
+            settings["GENERATE_INFOPLIST_FILE"] = std::string("YES");
+            settings["PACKAGE_RESOURCE_TARGET_KIND"] = std::string("regular");
+            settings["SDK_VARIANT"] = std::string("auto");
+            settings["SDKROOT"] = std::string("auto");
+            settings["SWIFT_VERSION"] = std::string("5");
+            t["buildConfigurations"] = packageBuildConfigurations(dynGUID, settings);
+
+            /* The dynamic framework carries the module's sibling dependencies
+             * (but not its resource bundle). */
+            JArray dynDeps;
+            for (auto const &dep : directModuleDeps(ti)) {
+                dynDeps.push_back(packageDependency("PACKAGE-TARGET:" + dep));
+            }
+            t["dependencies"] = dynDeps;
+
+            JObject sources;
+            sources["guid"] = dynGUID + "::BUILDPHASE_0";
+            sources["type"] = std::string("com.apple.buildphase.sources");
+            sources["buildFiles"] = JArray{};
+            t["buildPhases"] = JArray{sources};
+
+            addTarget(t);
+        }
+
+        /* Resource bundle target (only when the module declares resources). */
+        if (ti != nullptr && ti->hasResources) {
+            JObject t;
+            t["guid"] = resGUID;
+            t["name"] = resBundleName;
+            t["type"] = std::string("standard");
+            t["approvedByUser"] = std::string("true");
+            t["customTasks"] = JArray{};
+            t["buildRules"] = JArray{};
+            t["productTypeIdentifier"] = std::string("com.apple.product-type.bundle");
+            t["productReference"] = packageProductReference(resGUID, resBundleName);
+
+            JObject settings;
+            settings["PRODUCT_NAME"] = std::string("$(TARGET_NAME)");
+            settings["TARGET_NAME"] = resBundleName;
+            settings["PRODUCT_MODULE_NAME"] = resBundleName;
+            settings["PACKAGE_RESOURCE_TARGET_KIND"] = std::string("resource");
+            settings["GENERATE_INFOPLIST_FILE"] = std::string("YES");
+            settings["SDK_VARIANT"] = std::string("auto");
+            settings["SDKROOT"] = std::string("auto");
+            t["buildConfigurations"] = packageBuildConfigurations(resGUID, settings);
+
+            t["dependencies"] = JArray{};
+
+            JObject resources;
+            resources["guid"] = resGUID + "::BUILDPHASE_0";
+            resources["type"] = std::string("com.apple.buildphase.resources");
+            resources["buildFiles"] = JArray{};
+            t["buildPhases"] = JArray{resources};
+
+            addTarget(t);
+        }
+    }
+
+    /* Package project. */
     JObject p;
-    std::string guid = packageProjectGUID(g);
-    p["guid"] = guid;
+    p["guid"] = projGUID;
     p["path"] = g.dir + "/Package.swift";
     p["projectDirectory"] = g.dir;
     p["projectName"] = g.name;
@@ -1152,18 +1516,20 @@ JObject emitPackageProject(PackageGraph const &g) {
     p["defaultConfigurationName"] = std::string("Release");
     p["buildConfigurations"] = JArray{};
 
-    /* Minimal group tree rooted at the package directory. The host's full tree
-     * enumerates every source and resource file; that refinement is pending. */
     JObject group;
-    group["guid"] = guid + "::MAINGROUP";
+    group["guid"] = projGUID + "::MAINGROUP";
     group["sourceTree"] = std::string("<absolute>");
     group["name"] = g.name;
     group["path"] = g.dir;
     group["type"] = std::string("group");
     p["groupTree"] = group;
 
-    p["targets"] = JArray{};
-    return p;
+    JArray targetSigs;
+    for (auto const &t : out.targets) targetSigs.push_back(t.first);
+    p["targets"] = targetSigs;
+
+    out.project = p;
+    return out;
 }
 
 } /* namespace */
@@ -1345,13 +1711,23 @@ Run(process::User const *user, process::Context const *processContext, Filesyste
         }
     }
 
-    /* Synthesized Swift package projects (and, later, their targets). */
+    /* Synthesized Swift package projects and their targets. */
     for (auto const &g : packageGraphs) {
+        EmittedPackage ep = emitPackage(g);
+
         JObject po;
         po["type"] = "project";
         po["signature"] = packageSignature(packageProjectGUID(g));
-        po["contents"] = emitPackageProject(g);
+        po["contents"] = ep.project;
         pif.push_back(po);
+
+        for (auto const &t : ep.targets) {
+            JObject to;
+            to["type"] = "target";
+            to["signature"] = t.first;
+            to["contents"] = t.second;
+            pif.push_back(to);
+        }
     }
 
     JSONOut j;
