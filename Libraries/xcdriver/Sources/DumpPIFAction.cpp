@@ -405,7 +405,19 @@ ext::optional<std::vector<SplicedPackageObject>> loadPackagePIF(std::string cons
     std::string errPath = errFd >= 0 ? std::string(errTemplate.data()) : "/dev/null";
     if (errFd >= 0) close(errFd);
 
-    std::string cmd = "swift package --package-path " + shellSingleQuote(dir) +
+    /* When xcbuild is invoked through `xcrun xcodebuild` (as swift-build does to
+     * generate the PIF), xcrun injects a bare SDK name into SDKROOT (e.g.
+     * "macosx"). `swift package`'s build system rejects that as an invalid
+     * absolute path. Drop a non-absolute SDKROOT so SwiftPM resolves the SDK
+     * itself from DEVELOPER_DIR; keep it when it's already a real path. */
+    std::string envPrefix;
+    if (char const *sdkroot = getenv("SDKROOT")) {
+        if (sdkroot[0] != '\0' && sdkroot[0] != '/') {
+            envPrefix = "env -u SDKROOT ";
+        }
+    }
+
+    std::string cmd = envPrefix + "swift package --package-path " + shellSingleQuote(dir) +
                       " --build-system swiftbuild dump-pif 2>" + shellSingleQuote(errPath);
     FILE *pipe = popen(cmd.c_str(), "r");
     if (pipe == nullptr) {
