@@ -699,3 +699,91 @@ TEST(DumpPIFAction, BundleIdentifierGeneratedInfoPlist)
         EXPECT_EQ("$(PRODUCT_BUNDLE_IDENTIFIER)", id);
     }
 }
+
+/*
+ * A project whose single target's Sources phase mixes C and Objective-C files,
+ * with C in the majority. The predominant source language should follow the
+ * plurality (C), and Objective-C++/Swift markers should be absent.
+ */
+static char const kMixedLanguagePBXProj[] = R"PBX(// !$*UTF8*$!
+{
+    archiveVersion = 1;
+    classes = { };
+    objectVersion = 46;
+    objects = {
+
+        PROJECT0000000000000001 = {
+            isa = PBXProject;
+            buildConfigurationList = CFGLISTPROJECT000000001;
+            mainGroup = GROUPMAIN00000000000001;
+            targets = ( TARGETLIB00000000000001 );
+        };
+
+        GROUPMAIN00000000000001 = {
+            isa = PBXGroup;
+            children = ( FILEA00000000000000001, FILEB00000000000000001, FILEC00000000000000001, FILELIB0000000000000001 );
+            sourceTree = "<group>";
+        };
+
+        FILEA00000000000000001 = { isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = a.c; sourceTree = "<group>"; };
+        FILEB00000000000000001 = { isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = b.c; sourceTree = "<group>"; };
+        FILEC00000000000000001 = { isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = c.m; sourceTree = "<group>"; };
+        FILELIB0000000000000001 = { isa = PBXFileReference; explicitFileType = archive.ar; path = libmix.a; includeInIndex = 0; sourceTree = BUILT_PRODUCTS_DIR; };
+
+        BFA0000000000000000001 = { isa = PBXBuildFile; fileRef = FILEA00000000000000001; };
+        BFB0000000000000000001 = { isa = PBXBuildFile; fileRef = FILEB00000000000000001; };
+        BFC0000000000000000001 = { isa = PBXBuildFile; fileRef = FILEC00000000000000001; };
+
+        PHASESRC000000000001 = {
+            isa = PBXSourcesBuildPhase;
+            buildActionMask = 2147483647;
+            files = ( BFA0000000000000000001, BFB0000000000000000001, BFC0000000000000000001 );
+            runOnlyForDeploymentPostprocessing = 0;
+        };
+
+        TARGETLIB00000000000001 = {
+            isa = PBXNativeTarget;
+            buildConfigurationList = CFGLISTLIB0000000000001;
+            buildPhases = ( PHASESRC000000000001 );
+            buildRules = ( );
+            dependencies = ( );
+            name = mix;
+            productName = mix;
+            productReference = FILELIB0000000000000001;
+            productType = "com.apple.product-type.library.static";
+        };
+
+        CFGBUILDPROJECT0000001 = { isa = XCBuildConfiguration; buildSettings = { }; name = Release; };
+        CFGBUILDLIB000000001 = { isa = XCBuildConfiguration; buildSettings = { }; name = Release; };
+
+        CFGLISTPROJECT000000001 = {
+            isa = XCConfigurationList;
+            buildConfigurations = ( CFGBUILDPROJECT0000001 );
+            defaultConfigurationIsVisible = 0;
+            defaultConfigurationName = Release;
+        };
+
+        CFGLISTLIB0000000000001 = {
+            isa = XCConfigurationList;
+            buildConfigurations = ( CFGBUILDLIB000000001 );
+            defaultConfigurationIsVisible = 0;
+            defaultConfigurationName = Release;
+        };
+
+    };
+    rootObject = PROJECT0000000000000001;
+}
+)PBX";
+
+/*
+ * Regression test for the predominant-source-language heuristic. A target that
+ * is mostly C (two .c files vs one .m) must report C, not Objective-C — the
+ * previous heuristic defaulted any non-Swift, non-.mm target to Objective-C.
+ */
+TEST(DumpPIFAction, PredominantSourceCodeLanguageC)
+{
+    std::string json = DumpPIF(kMixedLanguagePBXProj);
+    std::vector<std::string> langs = ExtractValues(json, "predominantSourceCodeLanguage");
+    ASSERT_EQ(1u, langs.size());
+    EXPECT_EQ("Xcode.SourceCodeLanguage.C", langs[0]);
+}

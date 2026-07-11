@@ -682,30 +682,82 @@ JValue emitNode(PIFContext const &ctx, pbxproj::PBX::Project const &project, pbx
 }
 
 /*
- * Pick a reasonable predominant source language based on the file extensions
- * found in the target's Sources build phase. Returns nullopt when the target
- * has no source files (e.g. aggregate or copy-only targets) so callers can
- * skip emitting the field, matching the host's behavior.
+ * Classify a source file into a compiler language family, preferring the
+ * file reference's declared type and falling back to its path extension.
+ * Non-source files (headers, resources, unknown types) return None so they
+ * don't sway the predominant-language tally.
+ */
+enum class SourceLanguage { None, C, ObjC, Cpp, ObjCpp, Swift };
+
+SourceLanguage classifySourceLanguage(pbxproj::PBX::GroupItem const &item) {
+    std::string type;
+    if (item.type() == pbxproj::PBX::GroupItem::Type::FileReference) {
+        auto const &fr = static_cast<pbxproj::PBX::FileReference const &>(item);
+        type = fr.lastKnownFileType();
+        if (type.empty()) type = fr.explicitFileType();
+    }
+    if (type.empty()) {
+        std::string const &p = item.path();
+        auto dot = p.rfind('.');
+        std::string ext = dot == std::string::npos ? std::string() : p.substr(dot + 1);
+        if (ext == "swift") type = "sourcecode.swift";
+        else if (ext == "mm") type = "sourcecode.cpp.objcpp";
+        else if (ext == "cpp" || ext == "cc" || ext == "cxx" || ext == "c++") type = "sourcecode.cpp.cpp";
+        else if (ext == "m") type = "sourcecode.c.objc";
+        else if (ext == "c") type = "sourcecode.c.c";
+    }
+
+    if (type == "sourcecode.swift")       return SourceLanguage::Swift;
+    if (type == "sourcecode.cpp.objcpp")  return SourceLanguage::ObjCpp;
+    if (type == "sourcecode.cpp.cpp")     return SourceLanguage::Cpp;
+    if (type == "sourcecode.c.objc")      return SourceLanguage::ObjC;
+    if (type == "sourcecode.c.c")         return SourceLanguage::C;
+    return SourceLanguage::None;
+}
+
+/*
+ * Pick the predominant source language from the files in the target's Sources
+ * build phases: the language family with the most files wins. Ties break toward
+ * the higher-level language (Swift > Objective-C++ > C++ > Objective-C > C),
+ * mirroring that e.g. an Objective-C file implies the C toolchain too. Returns
+ * nullopt when the target has no source files (e.g. aggregate or copy-only
+ * targets), so callers omit the field as the host does.
  */
 ext::optional<std::string> predominantSourceCodeLanguage(pbxproj::PBX::Target const &target) {
-    int total = 0, objcpp = 0, swift = 0;
+    int counts[6] = {0, 0, 0, 0, 0, 0};
+    int total = 0;
     for (auto const &phase : target.buildPhases()) {
         if (phase->type() != pbxproj::PBX::BuildPhase::Type::Sources) continue;
         for (auto const &bf : phase->files()) {
             if (bf->fileRef() == nullptr) continue;
-            std::string const &p = bf->fileRef()->path();
-            auto dot = p.rfind('.');
-            if (dot == std::string::npos) { total++; continue; }
-            std::string ext = p.substr(dot + 1);
             total++;
-            if (ext == "swift") swift++;
-            else if (ext == "mm") objcpp++;
+            counts[static_cast<int>(classifySourceLanguage(*bf->fileRef()))]++;
         }
     }
     if (total == 0) return ext::nullopt;
-    if (swift * 2 > total) return std::string("Xcode.SourceCodeLanguage.Swift");
-    if (objcpp > 0) return std::string("Xcode.SourceCodeLanguage.Objective-C-Plus-Plus");
-    return std::string("Xcode.SourceCodeLanguage.Objective-C");
+
+    /* Highest count wins; on a tie the earlier (higher-level) language in this
+     * priority order is chosen. */
+    struct { SourceLanguage lang; char const *id; } const order[] = {
+        { SourceLanguage::Swift,  "Xcode.SourceCodeLanguage.Swift" },
+        { SourceLanguage::ObjCpp, "Xcode.SourceCodeLanguage.Objective-C-Plus-Plus" },
+        { SourceLanguage::Cpp,    "Xcode.SourceCodeLanguage.C-Plus-Plus" },
+        { SourceLanguage::ObjC,   "Xcode.SourceCodeLanguage.Objective-C" },
+        { SourceLanguage::C,      "Xcode.SourceCodeLanguage.C" },
+    };
+    char const *best = nullptr;
+    int bestCount = 0;
+    for (auto const &entry : order) {
+        int c = counts[static_cast<int>(entry.lang)];
+        if (c > bestCount) {
+            bestCount = c;
+            best = entry.id;
+        }
+    }
+    /* Only non-source files (headers etc.) — fall back to Objective-C, the
+     * host's default for a target with no recognized source language. */
+    if (best == nullptr) return std::string("Xcode.SourceCodeLanguage.Objective-C");
+    return std::string(best);
 }
 
 JObject emitProject(PIFContext const &ctx, pbxproj::PBX::Project const &project) {
