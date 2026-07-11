@@ -53,6 +53,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <regex>
 #include <unistd.h>
 #include <map>
 #include <sstream>
@@ -436,6 +437,14 @@ ext::optional<std::vector<SplicedPackageObject>> loadPackagePIF(std::string cons
     }
     if (errFd >= 0) unlink(errPath.c_str());
 
+    /* Strip the PIF schema-version suffix that newer SwiftPM appends to every
+     * object GUID and reference (e.g. "…@11"). The host's GUIDs — and the
+     * package-product references our app target emits — use the bare form, and
+     * the suffix otherwise leaks into product names and breaks reference
+     * matching. Every occurrence is `@<digits>` immediately before a closing
+     * quote. */
+    out = std::regex_replace(out, std::regex("@[0-9]+\""), "\"");
+
     /* First parse: discover the GUIDs that need remapping. */
     std::vector<uint8_t> bytes(out.begin(), out.end());
     auto parsed = plist::Format::JSON::Deserialize(bytes, plist::Format::JSON::Create());
@@ -498,7 +507,17 @@ ext::optional<std::vector<SplicedPackageObject>> loadPackagePIF(std::string cons
         std::string t = type->value();
 
         if (t == "workspace") continue;
-        if (guid == "AGGREGATE" || guid == "ALL-INCLUDING-TESTS" || guid == "ALL-EXCLUDING-TESTS") continue;
+        /* Drop SwiftPM's standalone-only objects: the AGGREGATE project and the
+         * ALL-*-TESTS targets. Match by prefix — newer SwiftPM suffixes these
+         * GUIDs with a PIF schema version (e.g. "AGGREGATE@11"), and each
+         * package emits the same "AGGREGATE::MAINGROUP" group, which would
+         * collide across packages if not removed. */
+        auto startsWith = [](std::string const &s, char const *p) {
+            return s.compare(0, std::string(p).size(), p) == 0;
+        };
+        if (startsWith(guid, "AGGREGATE") ||
+            startsWith(guid, "ALL-INCLUDING-TESTS") ||
+            startsWith(guid, "ALL-EXCLUDING-TESTS")) continue;
         bool isProject = (t == "project");
         if (!isProject && t != "target") continue;
 
