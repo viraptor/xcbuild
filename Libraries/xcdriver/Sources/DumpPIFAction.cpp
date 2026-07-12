@@ -53,7 +53,6 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
-#include <regex>
 #include <unistd.h>
 #include <map>
 #include <sstream>
@@ -281,6 +280,18 @@ void stripPackageFileNodeNames(JValue &node) {
     }
 }
 
+/* Apply `fn` to every string scalar in the tree (in place). Templated on the
+ * functor to avoid pulling in <functional>. */
+template <typename F>
+void walkStrings(JValue &v, F const &fn) {
+    switch (v.kind) {
+        case JValue::K::Str: fn(v.s); break;
+        case JValue::K::Arr: for (auto &e : v.a) walkStrings(e, fn); break;
+        case JValue::K::Obj: for (auto &kv : v.o) walkStrings(kv.second, fn); break;
+        default: break;
+    }
+}
+
 struct SplicedPackageObject {
     bool isProject;
     std::string guid;
@@ -477,33 +488,44 @@ ext::optional<std::vector<SplicedPackageObject>> loadPackagePIF(std::string cons
     }
     if (errFd >= 0) unlink(errPath.c_str());
 
-    /* Strip the PIF schema-version suffix that newer SwiftPM appends to every
-     * object GUID and reference (e.g. "…@11"). The host's GUIDs — and the
-     * package-product references our app target emits — use the bare form, and
-     * the suffix otherwise leaks into product names and breaks reference
-     * matching. Every occurrence is `@<digits>` immediately before a closing
-     * quote. */
-    out = std::regex_replace(out, std::regex("@[0-9]+\""), "\"");
-
-    /* First parse: discover the GUIDs that need remapping. */
+    /* Parse SwiftPM's PIF once and adapt it on the parsed tree rather than by
+     * text substitution. */
     std::vector<uint8_t> bytes(out.begin(), out.end());
     auto parsed = plist::Format::JSON::Deserialize(bytes, plist::Format::JSON::Create());
-    auto arr = plist::CastTo<plist::Array>(parsed.first.get());
-    if (arr == nullptr) return ext::nullopt;
+    auto arrPlist = plist::CastTo<plist::Array>(parsed.first.get());
+    if (arrPlist == nullptr) return ext::nullopt;
+    JValue root = plistToJValue(arrPlist);
+    if (root.kind != JValue::K::Arr) return ext::nullopt;
 
+    /* Strip the PIF schema-version suffix that newer SwiftPM appends to every
+     * object GUID and reference (e.g. "…@11"): a trailing '@' followed only by
+     * digits. The host's GUIDs — and the package-product references our app
+     * target emits — use the bare form, and the suffix otherwise leaks into
+     * product names and breaks reference matching. */
+    walkStrings(root, [](std::string &s) {
+        size_t at = s.rfind('@');
+        if (at == std::string::npos || at + 1 >= s.size()) return;
+        for (size_t k = at + 1; k < s.size(); k++) {
+            if (s[k] < '0' || s[k] > '9') return;
+        }
+        s.erase(at);
+    });
+
+    /* Discover the GUIDs that need remapping to the host's app-embedded scheme. */
     std::vector<std::pair<std::string, std::string>> remaps; /* from -> to */
-    for (size_t i = 0; i < arr->count(); i++) {
-        auto o = arr->value<plist::Dictionary>(i);
-        if (o == nullptr) continue;
-        auto type = o->value<plist::String>("type");
-        auto contents = o->value<plist::Dictionary>("contents");
-        if (type == nullptr || contents == nullptr) continue;
-        auto guidS = contents->value<plist::String>("guid");
-        if (guidS == nullptr) continue;
-        std::string guid = guidS->value();
-        if (type->value() == "project" && guid.rfind("PACKAGE:", 0) == 0) {
+    for (auto const &elem : root.a) {
+        if (elem.kind != JValue::K::Obj) continue;
+        auto typeIt = elem.o.find("type");
+        auto contentsIt = elem.o.find("contents");
+        if (typeIt == elem.o.end() || typeIt->second.kind != JValue::K::Str) continue;
+        if (contentsIt == elem.o.end() || contentsIt->second.kind != JValue::K::Obj) continue;
+        auto guidIt = contentsIt->second.o.find("guid");
+        if (guidIt == contentsIt->second.o.end() || guidIt->second.kind != JValue::K::Str) continue;
+        std::string const &type = typeIt->second.s;
+        std::string const &guid = guidIt->second.s;
+        if (type == "project" && guid.rfind("PACKAGE:", 0) == 0) {
             remaps.emplace_back(guid, "PACKAGE:" + dir);
-        } else if (type->value() == "target" && guid.rfind("PACKAGE-PRODUCT:", 0) == 0) {
+        } else if (type == "target" && guid.rfind("PACKAGE-PRODUCT:", 0) == 0) {
             /* SwiftPM's product GUID is `PACKAGE-PRODUCT:<identity>_<module>.<product>`
              * and its name is `<product>-product`; the host uses just
              * `PACKAGE-PRODUCT:<product>`. Recover the product name from the guid
@@ -516,42 +538,43 @@ ext::optional<std::vector<SplicedPackageObject>> loadPackagePIF(std::string cons
         }
     }
     if (remaps.empty()) return ext::nullopt;
-    /* Replace longer GUIDs first so no remap key is a prefix of another. */
+    /* Longest-first so no remap key clobbers another it is a prefix of. */
     std::sort(remaps.begin(), remaps.end(), [](std::pair<std::string, std::string> const &a, std::pair<std::string, std::string> const &b) {
         return a.first.size() > b.first.size();
     });
-    for (auto const &r : remaps) {
-        size_t pos = 0;
-        while ((pos = out.find(r.first, pos)) != std::string::npos) {
-            out.replace(pos, r.first.size(), r.second);
-            pos += r.second.size();
-        }
-    }
 
-    /* Second parse: the remapped PIF. */
-    std::vector<uint8_t> bytes2(out.begin(), out.end());
-    auto parsed2 = plist::Format::JSON::Deserialize(bytes2, plist::Format::JSON::Create());
-    auto arr2 = plist::CastTo<plist::Array>(parsed2.first.get());
-    if (arr2 == nullptr) return ext::nullopt;
+    /* Rewrite references to the remapped GUIDs. A project's own GUID is also the
+     * prefix of its derived config/group GUIDs (`<guid>::BUILDCONFIG_0`,
+     * `<guid>::MAINGROUP::REF_…`), so we substring-replace within each string
+     * rather than match whole strings. Operating on parsed string scalars (not
+     * the raw JSON) keeps a match from ever spanning a value boundary. */
+    walkStrings(root, [&remaps](std::string &s) {
+        for (auto const &r : remaps) {
+            size_t pos = 0;
+            while ((pos = s.find(r.first, pos)) != std::string::npos) {
+                s.replace(pos, r.first.size(), r.second);
+                pos += r.second.size();
+            }
+        }
+    });
 
     std::vector<SplicedPackageObject> result;
-    for (size_t i = 0; i < arr2->count(); i++) {
-        auto o = arr2->value<plist::Dictionary>(i);
-        if (o == nullptr) continue;
-        auto type = o->value<plist::String>("type");
-        auto contents = o->value<plist::Dictionary>("contents");
-        if (type == nullptr || contents == nullptr) continue;
-        auto guidS = contents->value<plist::String>("guid");
-        if (guidS == nullptr) continue;
-        std::string guid = guidS->value();
-        std::string t = type->value();
+    for (auto &elem : root.a) {
+        if (elem.kind != JValue::K::Obj) continue;
+        auto typeIt = elem.o.find("type");
+        auto contentsIt = elem.o.find("contents");
+        if (typeIt == elem.o.end() || typeIt->second.kind != JValue::K::Str) continue;
+        if (contentsIt == elem.o.end() || contentsIt->second.kind != JValue::K::Obj) continue;
+        auto guidIt = contentsIt->second.o.find("guid");
+        if (guidIt == contentsIt->second.o.end() || guidIt->second.kind != JValue::K::Str) continue;
+        std::string t = typeIt->second.s;
+        std::string guid = guidIt->second.s;
 
         if (t == "workspace") continue;
         /* Drop SwiftPM's standalone-only objects: the AGGREGATE project and the
-         * ALL-*-TESTS targets. Match by prefix — newer SwiftPM suffixes these
-         * GUIDs with a PIF schema version (e.g. "AGGREGATE@11"), and each
-         * package emits the same "AGGREGATE::MAINGROUP" group, which would
-         * collide across packages if not removed. */
+         * ALL-*-TESTS targets. Match by prefix — each package emits the same
+         * "AGGREGATE::MAINGROUP" group, which would collide across packages if
+         * not removed. */
         auto startsWith = [](std::string const &s, char const *p) {
             return s.compare(0, std::string(p).size(), p) == 0;
         };
@@ -566,9 +589,10 @@ ext::optional<std::vector<SplicedPackageObject>> loadPackagePIF(std::string cons
          * same signatures or swift-build won't associate them with the project
          * (and the package products won't be found). */
         std::string signature;
-        if (auto sigS = o->value<plist::String>("signature")) signature = sigS->value();
+        auto sigIt = elem.o.find("signature");
+        if (sigIt != elem.o.end() && sigIt->second.kind == JValue::K::Str) signature = sigIt->second.s;
 
-        JValue jc = plistToJValue(contents);
+        JValue jc = std::move(contentsIt->second);
         if (isProject) {
             auto gt = jc.o.find("groupTree");
             if (gt != jc.o.end()) stripPackageFileNodeNames(gt->second);
