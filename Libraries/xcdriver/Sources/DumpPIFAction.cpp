@@ -36,7 +36,12 @@
 #include <pbxsetting/Value.h>
 #include <pbxsetting/XC/Config.h>
 #include <plist/Format/Any.h>
+#include <plist/Format/JSON.h>
+#include <plist/Array.h>
+#include <plist/Boolean.h>
 #include <plist/Dictionary.h>
+#include <plist/Integer.h>
+#include <plist/Real.h>
 #include <plist/String.h>
 #include <libutil/Filesystem.h>
 #include <libutil/FSUtil.h>
@@ -46,6 +51,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <map>
 #include <sstream>
 #include <string>
@@ -221,6 +227,165 @@ std::string md5Hex(uint8_t const *data, size_t n) {
 
 std::string md5Hex(std::string const &s) {
     return md5Hex((uint8_t const *)s.data(), s.size());
+}
+
+std::string shellSingleQuote(std::string const &s) {
+    std::string out = "'";
+    for (char c : s) {
+        if (c == '\'') out += "'\\''";
+        else out += c;
+    }
+    out += "'";
+    return out;
+}
+
+/* Recursively convert a parsed plist value tree into our JValue tree, so PIF
+ * fragments SwiftPM emits can be re-serialized through the same writer. */
+JValue plistToJValue(plist::Object const *o) {
+    if (o == nullptr) return JValue();
+    if (auto d = plist::CastTo<plist::Dictionary>(o)) {
+        JObject obj;
+        for (size_t i = 0; i < d->count(); i++) {
+            std::string k = d->key(i);
+            obj[k] = plistToJValue(d->value(k));
+        }
+        return JValue::Obj(std::move(obj));
+    }
+    if (auto a = plist::CastTo<plist::Array>(o)) {
+        JArray arr;
+        for (size_t i = 0; i < a->count(); i++) arr.push_back(plistToJValue(a->value(i)));
+        return JValue::Arr(std::move(arr));
+    }
+    if (auto s = plist::CastTo<plist::String>(o)) return JValue::Str(s->value());
+    if (auto b = plist::CastTo<plist::Boolean>(o)) return JValue(b->value());
+    if (auto n = plist::CastTo<plist::Integer>(o)) return JValue((long long)n->value());
+    if (auto r = plist::CastTo<plist::Real>(o)) return JValue((long long)r->value());
+    return JValue();
+}
+
+/* Drop the redundant `name` (a copy of the absolute path) that SwiftPM emits on
+ * file nodes of a package's group tree; the host omits it. */
+void stripPackageFileNodeNames(JValue &node) {
+    if (node.kind != JValue::K::Obj) return;
+    auto ty = node.o.find("type");
+    if (ty != node.o.end() && ty->second.kind == JValue::K::Str &&
+        (ty->second.s == "file" || ty->second.s == "fileReference")) {
+        node.o.erase("name");
+    }
+    auto ch = node.o.find("children");
+    if (ch != node.o.end() && ch->second.kind == JValue::K::Arr) {
+        for (auto &c : ch->second.a) stripPackageFileNodeNames(c);
+    }
+}
+
+struct SplicedPackageObject {
+    bool isProject;
+    std::string guid;
+    JValue contents;
+};
+
+/*
+ * Obtain a Swift package's PIF directly from SwiftPM
+ * (`swift package --build-system swiftbuild dump-pif`) and adapt it to the
+ * host's app-embedded scheme. SwiftPM is the source of truth for the package's
+ * group tree, build phases, and build settings, so we splice its output rather
+ * than reproduce the synthesis. Adaptation:
+ *   - remap the project GUID from SwiftPM's `PACKAGE:<identity>` to the host's
+ *     `PACKAGE:<absolute-dir>`, and each product GUID
+ *     `PACKAGE-PRODUCT:<identity>_<module>.<product>` to `PACKAGE-PRODUCT:<product>`,
+ *     rewriting every reference (done as text replacement before re-parsing);
+ *   - drop SwiftPM's standalone-only objects (its Workspace, the AGGREGATE
+ *     project, and the ALL-*-TESTS targets);
+ *   - strip the redundant file-node names from the group tree.
+ * Returns nullopt if the toolchain is unavailable, so callers degrade to no
+ * package projects rather than failing.
+ */
+ext::optional<std::vector<SplicedPackageObject>> loadPackagePIF(std::string const &dir) {
+    std::string cmd = "swift package --package-path " + shellSingleQuote(dir) +
+                      " --build-system swiftbuild dump-pif 2>/dev/null";
+    FILE *pipe = popen(cmd.c_str(), "r");
+    if (pipe == nullptr) return ext::nullopt;
+    std::string out;
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), pipe)) > 0) out.append(buf, n);
+    int rc = pclose(pipe);
+    if (rc != 0 || out.empty()) return ext::nullopt;
+
+    /* First parse: discover the GUIDs that need remapping. */
+    std::vector<uint8_t> bytes(out.begin(), out.end());
+    auto parsed = plist::Format::JSON::Deserialize(bytes, plist::Format::JSON::Create());
+    auto arr = plist::CastTo<plist::Array>(parsed.first.get());
+    if (arr == nullptr) return ext::nullopt;
+
+    std::vector<std::pair<std::string, std::string>> remaps; /* from -> to */
+    for (size_t i = 0; i < arr->count(); i++) {
+        auto o = arr->value<plist::Dictionary>(i);
+        if (o == nullptr) continue;
+        auto type = o->value<plist::String>("type");
+        auto contents = o->value<plist::Dictionary>("contents");
+        if (type == nullptr || contents == nullptr) continue;
+        auto guidS = contents->value<plist::String>("guid");
+        if (guidS == nullptr) continue;
+        std::string guid = guidS->value();
+        if (type->value() == "project" && guid.rfind("PACKAGE:", 0) == 0) {
+            remaps.emplace_back(guid, "PACKAGE:" + dir);
+        } else if (type->value() == "target" && guid.rfind("PACKAGE-PRODUCT:", 0) == 0) {
+            /* SwiftPM's product GUID is `PACKAGE-PRODUCT:<identity>_<module>.<product>`
+             * and its name is `<product>-product`; the host uses just
+             * `PACKAGE-PRODUCT:<product>`. Recover the product name from the guid
+             * (after the final dot), matching how the consuming app references it. */
+            auto dot = guid.rfind('.');
+            std::string product = (dot == std::string::npos)
+                ? guid.substr(std::string("PACKAGE-PRODUCT:").size())
+                : guid.substr(dot + 1);
+            remaps.emplace_back(guid, "PACKAGE-PRODUCT:" + product);
+        }
+    }
+    if (remaps.empty()) return ext::nullopt;
+    /* Replace longer GUIDs first so no remap key is a prefix of another. */
+    std::sort(remaps.begin(), remaps.end(), [](std::pair<std::string, std::string> const &a, std::pair<std::string, std::string> const &b) {
+        return a.first.size() > b.first.size();
+    });
+    for (auto const &r : remaps) {
+        size_t pos = 0;
+        while ((pos = out.find(r.first, pos)) != std::string::npos) {
+            out.replace(pos, r.first.size(), r.second);
+            pos += r.second.size();
+        }
+    }
+
+    /* Second parse: the remapped PIF. */
+    std::vector<uint8_t> bytes2(out.begin(), out.end());
+    auto parsed2 = plist::Format::JSON::Deserialize(bytes2, plist::Format::JSON::Create());
+    auto arr2 = plist::CastTo<plist::Array>(parsed2.first.get());
+    if (arr2 == nullptr) return ext::nullopt;
+
+    std::vector<SplicedPackageObject> result;
+    for (size_t i = 0; i < arr2->count(); i++) {
+        auto o = arr2->value<plist::Dictionary>(i);
+        if (o == nullptr) continue;
+        auto type = o->value<plist::String>("type");
+        auto contents = o->value<plist::Dictionary>("contents");
+        if (type == nullptr || contents == nullptr) continue;
+        auto guidS = contents->value<plist::String>("guid");
+        if (guidS == nullptr) continue;
+        std::string guid = guidS->value();
+        std::string t = type->value();
+
+        if (t == "workspace") continue;
+        if (guid == "AGGREGATE" || guid == "ALL-INCLUDING-TESTS" || guid == "ALL-EXCLUDING-TESTS") continue;
+        bool isProject = (t == "project");
+        if (!isProject && t != "target") continue;
+
+        JValue jc = plistToJValue(contents);
+        if (isProject) {
+            auto gt = jc.o.find("groupTree");
+            if (gt != jc.o.end()) stripPackageFileNodeNames(gt->second);
+        }
+        result.push_back({isProject, guid, std::move(jc)});
+    }
+    return result;
 }
 
 /*
@@ -1003,6 +1168,20 @@ JObject emitTarget(PIFContext const &ctx, Filesystem *filesystem, pbxproj::PBX::
     return t;
 }
 
+/*
+ * Signatures for spliced package objects. The host's are MD5s of its internal
+ * NSJSONSerialization output, which we can't reproduce, so we emit stable
+ * placeholders keyed on the GUID (as for the main project's `_mod=`);
+ * signatures only affect the host's incremental caching, not loading.
+ */
+std::string packageSignature(std::string const &guid) {
+    return "PACKAGE@v12_hash=" + md5Hex(guid);
+}
+
+std::string packageTargetSignature(std::string const &guid) {
+    return "TARGET@v12_hash=" + md5Hex(guid);
+}
+
 } /* namespace */
 
 int DumpPIFAction::
@@ -1110,6 +1289,35 @@ Run(process::User const *user, process::Context const *processContext, Filesyste
         }
     }
 
+    /*
+     * Discover Swift packages referenced by any project and obtain each one's
+     * PIF from SwiftPM (`swift package ... dump-pif`), adapted to the host's
+     * app-embedded GUID scheme. Packages are keyed by their resolved directory
+     * and ordered by it for determinism. Each entry is the package's list of
+     * spliced PIF objects (its project plus targets).
+     */
+    std::vector<std::vector<SplicedPackageObject>> packagePIFs;
+    {
+        std::unordered_set<std::string> seenPackageDirs;
+        std::vector<std::string> packageDirs;
+        for (auto const &project : projects) {
+            for (auto const &ref : project->packageReferences()) {
+                std::string dir = libutil::FSUtil::ResolveRelativePath(ref->relativePath(), project->basePath());
+                if (seenPackageDirs.insert(dir).second) {
+                    packageDirs.push_back(dir);
+                }
+            }
+        }
+        std::sort(packageDirs.begin(), packageDirs.end());
+        for (auto const &dir : packageDirs) {
+            if (auto objs = loadPackagePIF(dir)) {
+                packagePIFs.push_back(std::move(*objs));
+            } else {
+                fprintf(stderr, "warning: unable to load Swift package at '%s' (swift toolchain required); its targets will be omitted from the PIF\n", dir.c_str());
+            }
+        }
+    }
+
     /* Workspace object. */
     {
         JObject ws;
@@ -1123,6 +1331,15 @@ Run(process::User const *user, process::Context const *processContext, Filesyste
             std::string sig = projectSignature(ctx, *p, projectMod[p.get()]);
             projectSigsForJSON.push_back(sig);
             projectSigsForHash.push_back(sig);
+        }
+        for (auto const &objs : packagePIFs) {
+            for (auto const &obj : objs) {
+                if (obj.isProject) {
+                    std::string sig = packageSignature(obj.guid);
+                    projectSigsForJSON.push_back(sig);
+                    projectSigsForHash.push_back(sig);
+                }
+            }
         }
         contents["projects"] = projectSigsForJSON;
 
@@ -1146,6 +1363,17 @@ Run(process::User const *user, process::Context const *processContext, Filesyste
             to["signature"] = targetSignature(ctx, *project, *target);
             to["contents"] = emitTarget(ctx, filesystem, *project, *target);
             pif.push_back(to);
+        }
+    }
+
+    /* Swift package projects and targets, spliced from SwiftPM's PIF. */
+    for (auto const &objs : packagePIFs) {
+        for (auto const &obj : objs) {
+            JObject o;
+            o["type"] = obj.isProject ? "project" : "target";
+            o["signature"] = obj.isProject ? packageSignature(obj.guid) : packageTargetSignature(obj.guid);
+            o["contents"] = obj.contents;
+            pif.push_back(o);
         }
     }
 
