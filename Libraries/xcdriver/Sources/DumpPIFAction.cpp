@@ -421,9 +421,19 @@ ext::optional<std::vector<SplicedPackageObject>> loadPackagePIF(std::string cons
      * report *why* (missing toolchain, manifest error, ...) instead of silently
      * dropping the package — which downstream surfaces only as swift-build's
      * opaque "Missing package product". */
-    char errTemplate[] = "/tmp/xcbuild-swiftpm-XXXXXX";
-    int errFd = mkstemp(errTemplate);
-    std::string errPath = errFd >= 0 ? errTemplate : "/dev/null";
+    std::string tmpDir = "/tmp";
+    if (char const *t = getenv("TMPDIR")) {
+        if (t[0] != '\0') {
+            tmpDir = t;
+            while (tmpDir.size() > 1 && tmpDir.back() == '/') tmpDir.pop_back();
+        }
+    }
+    std::vector<char> errTemplate;
+    std::string errTemplateStr = tmpDir + "/xcbuild-swiftpm-XXXXXX";
+    errTemplate.assign(errTemplateStr.begin(), errTemplateStr.end());
+    errTemplate.push_back('\0');
+    int errFd = mkstemp(errTemplate.data());
+    std::string errPath = errFd >= 0 ? std::string(errTemplate.data()) : "/dev/null";
     if (errFd >= 0) close(errFd);
 
     /* When xcbuild is invoked through `xcrun xcodebuild` (as swift-build does to
