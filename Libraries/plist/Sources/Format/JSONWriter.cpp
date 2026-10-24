@@ -68,10 +68,11 @@ primitiveWriteEscapedString(std::string const &string)
         return false;
     }
 
-    for (char c : string) {
+    /* UTF-8 bytes above 0x7f are not control characters. */
+    for (unsigned char c : string) {
         if (c < 0x20) {
             char buf[64];
-            int rc = snprintf(buf, sizeof(buf), "\\%04x", c);
+            int rc = snprintf(buf, sizeof(buf), "\\u%04x", c);
             assert(rc < (int)sizeof(buf));
             (void)rc;
 
@@ -81,7 +82,7 @@ primitiveWriteEscapedString(std::string const &string)
         } else {
             switch (c) {
                 case '"':  if (!primitiveWriteString("\\\"")) { return false; } break;
-                case '\\': if (!primitiveWriteString("\\"))   { return false; } break;
+                case '\\': if (!primitiveWriteString("\\\\")) { return false; } break;
                 default: _contents.push_back(c); break;
             }
         }

@@ -71,6 +71,57 @@ TEST(JSON, String)
     EXPECT_EQ(*serialize.first, contents);
 }
 
+TEST(JSON, SerializeEscapedStrings)
+{
+    struct EscapeCase {
+        char const *name;
+        std::string value;
+        char const *json;
+        char const *alternative;
+    };
+
+    EscapeCase const cases[] = {
+        /* Control characters must be escaped, including embedded NUL. */
+        { "newline",         "a\nb", R"("a\nb")", R"("a\u000ab")" },
+        { "carriage return", "a\rb", R"("a\rb")", R"("a\u000db")" },
+        { "tab",             "a\tb", R"("a\tb")", R"("a\u0009b")" },
+        { "backspace",       "a\bb", R"("a\bb")", R"("a\u0008b")" },
+        { "form feed",       "a\fb", R"("a\fb")", R"("a\u000cb")" },
+        { "NUL", std::string("a\0b", 3), R"("a\u0000b")", nullptr },
+        { "unit separator",  "a\x1f" "b", R"("a\u001fb")", nullptr },
+
+        /* Quotes and backslashes must preserve the original string. */
+        { "quote",     "a\"b",  R"("a\"b")", nullptr },
+        { "backslash", "a\\b", R"("a\\b")", nullptr },
+
+        /* UTF-8 bytes must not be mistaken for control characters. */
+        { "UTF-8", u8"café ☃ 😀", R"("café ☃ 😀")", R"("caf\u00e9 \u2603 \ud83d\ude00")" },
+    };
+
+    auto document = [](std::string const &json) {
+        return "{\n\t" + json + ": " + json + "\n}";
+    };
+
+    for (auto const &test : cases) {
+        SCOPED_TRACE(test.name);
+
+        /* Exercise the same string as both a dictionary key and a value. */
+        auto dictionary = Dictionary::New();
+        dictionary->set(test.value, String::New(test.value));
+
+        auto serialize = JSON::Serialize(dictionary.get(), JSON::Create());
+        ASSERT_NE(serialize.first, nullptr);
+        std::string actual(serialize.first->begin(), serialize.first->end());
+
+        /* JSON permits both short escapes and Unicode escapes. */
+        if (test.alternative != nullptr && actual == document(test.alternative)) {
+            continue;
+        }
+
+        EXPECT_EQ(actual, document(test.json));
+    }
+}
+
 TEST(JSON, BooleanNumber)
 {
     auto contents = Contents("{\n\t\"boolean\": true,\n\t\"integer\": 42,\n\t\"real\": 3.14\n}");
